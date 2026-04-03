@@ -996,6 +996,19 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
     logger.info(f"处理电子书 {title}，共 {total} 张图片")
     max_workers = settings['max_workers']
     logger.info(f"使用 {max_workers} 个进程并行处理图片")
+
+    # ========== 修复：为 settings 添加 'format' 键 ==========
+    # 根据输出类型推断位深，设置 format 供 core.py 使用
+    out_type = settings.get('out_type')
+    out_value = settings.get('out_value')
+    # 如果输出是 2-bit 格式（XTCH 或 XTH），则使用 xth，否则使用 xtg（1-bit）
+    if out_type == 'format' and out_value in ('xtch', 'xth'):
+        bits = 2
+    else:
+        bits = 1
+    settings['format'] = 'xth' if bits == 2 else 'xtg'
+    # ========== 修复结束 ==========
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         img_paths = []
