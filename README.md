@@ -3,9 +3,9 @@
 
 软件需要安装Python运行环境，会自动安装剩余所需的运行组件，需下载UnRAR.exe（跟py文件放一起）才能运行 或者使用命令打包成单文件：
 
-控制台版本：python -m PyInstaller --onefile --console --name zipcomic2xtc --add-data "UnRAR.exe;." --collect-all numba --collect-all llvmlite --hidden-import numpy --hidden-import py7zr --hidden-import rarfile ebook2xtx.py
+控制台版本：python -m PyInstaller --onefile --console --name Ebook2XTX --add-data "UnRAR.exe;." --collect-all numba --collect-all llvmlite --hidden-import numpy --hidden-import py7zr --hidden-import rarfile ebook2xtx.py
 
-GUI：python -m PyInstaller --onefile --noconsole --name zipcomic2xtc_GUI --add-data "UnRAR.exe;." --collect-all numba --collect-all llvmlite --hidden-import numpy --hidden-import py7zr --hidden-import rarfile ebook2xtx_GUI.py
+GUI：python -m PyInstaller --onefile --noconsole --name Ebook2XTX_GUI --add-data "UnRAR.exe;." --collect-all numba --collect-all llvmlite --hidden-import numpy --hidden-import py7zr --hidden-import rarfile ebook2xtx_GUI.py
 
 支持输入的格式：XTC (1-bit 黑白，容器格式) XTCH (2-bit 4级灰度，容器格式) XTG (1-bit 黑白，单页模式) XTH (2-bit 4级灰度，单页模式)，压缩包（zip，rar，7z，cbr，cbz等）格式的图片（jpg，bmp，png，webp等）漫画，文件夹形式的图片漫画（jpg，bmp，png，webp等），电子书格式（pdf，epub，mobi，azw3）的漫画，纯文本/图文混排的电子书格式暂不支持（仅支持导出图片或导出文本为txt文件）。
 支持转换的格式： XTC (1-bit 黑白，容器格式，单文件) XTCH (2-bit 4级灰度，容器格式，单文件) XTG (1-bit 黑白，单页模式，每个图片单独输出) XTH (2-bit 4级灰度，单页模式，每个图片单独输出)，图片格式（jpg，png，webp，bmp），电子书格式（epub，pdf）
