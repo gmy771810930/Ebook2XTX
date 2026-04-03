@@ -93,6 +93,9 @@ def rotate_image(img: Image.Image, mode: str) -> Image.Image:
         return img
 
 def resize_to_target(img: Image.Image, target_width: int, target_height: int, stretch: bool) -> Image.Image:
+    """缩放图片到目标尺寸。若目标尺寸为0，则返回原图。"""
+    if target_width <= 0 or target_height <= 0:
+        return img
     if stretch:
         return img.resize((target_width, target_height), Image.Resampling.LANCZOS)
     else:
@@ -361,7 +364,12 @@ def _process_single_frame(img: Image.Image, idx: int, total: int, settings: dict
         # 对所有图片（或子图）进行缩放/拉伸
         encoded_pages = []
         for part_img in splits:
-            part_img = resize_to_target(part_img, settings['width'], settings['height'], settings['stretch'])
+            # 修复：如果目标尺寸为0，则跳过缩放
+            target_w = settings['width']
+            target_h = settings['height']
+            if target_w > 0 and target_h > 0:
+                part_img = resize_to_target(part_img, target_w, target_h, settings['stretch'])
+            # 否则保持原尺寸
             gray_arr = np.array(part_img, dtype=np.float32)
             bits = 1 if settings['format'] in ('xtc', 'xtg') else 2
             dithered = floyd_steinberg_dither_numba(gray_arr, bits, settings['dither_strength'])

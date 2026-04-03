@@ -2,34 +2,61 @@
 # -*- coding: utf-8 -*-
 
 """
-电子书转换工具 - 图形化界面 (Ebook2XTX)
+电子书转换工具 - 图形化界面 (Ebook2XTX v1.5)
 基于 tkinter，与 Ebook2XTX.py 共享核心处理逻辑
-布局：
-- 目录设置（固定顶部）
-- 中间区域：PanedWindow 水平分割
-  - 左侧：参数选项（双排，支持垂直滚动）
-  - 右侧：日志区域（ScrolledText 自带滚动条）
-- 转换进度（固定底部）
-窗口最小尺寸保证关键控件可见
+支持输出图片格式、原分辨率、电子书输入等
+支持输出电子书格式（EPUB/PDF）
 """
 
 import os
 import sys
+import subprocess
 import threading
 import queue
 import logging
 import webbrowser
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-# 导入转换模块（修正模块名）
-from ebook2xtx import convert_archives, parse_size_string
-import ebook2xtx
+# ========== 前置依赖检查 ==========
+def ensure_dependencies():
+    required = [
+        ('Pillow', 'from PIL import Image'),
+        ('py7zr', 'import py7zr'),
+        ('rarfile', 'import rarfile'),
+        ('natsort', 'from natsort import natsorted'),
+        ('numpy', 'import numpy as np'),
+        ('numba', 'from numba import njit'),
+        ('PyMuPDF', 'import fitz'),
+        ('ebooklib', 'import ebooklib'),
+        ('BeautifulSoup4', 'from bs4 import BeautifulSoup'),
+        ('mobi', 'import mobi'),
+        ('img2pdf', 'import img2pdf')
+    ]
+    missing = []
+    for pkg, stmt in required:
+        try:
+            exec(stmt)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print(f"正在安装缺失的依赖: {', '.join(missing)}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+        for pkg, stmt in required:
+            exec(stmt)
+        print("依赖安装完成。")
 
-# ========== 日志重定向到 GUI ==========
+ensure_dependencies()
+
+# 导入转换模块（只导入需要的函数，不导入 convert_items）
+from ebook2xtx import (
+    parse_size_string, check_and_install_dependencies, scan_input_items,
+    InputItem, sanitize_filename, process_images, process_images_to_ebook
+)
+
+# ========== 日志重定向 ==========
 class QueueHandler(logging.Handler):
     def __init__(self, log_queue):
         super().__init__()
@@ -38,10 +65,19 @@ class QueueHandler(logging.Handler):
     def emit(self, record):
         self.log_queue.put(self.format(record))
 
-def setup_gui_logging(log_queue):
+def setup_gui_logging(log_queue, enable_file_log=False):
+    for handler in logging.getLogger().handlers[:]:
+        logging.getLogger().removeHandler(handler)
     handler = QueueHandler(log_queue)
     handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logging.getLogger().addHandler(handler)
+    if enable_file_log:
+        log_dir = Path.cwd() / "log"
+        log_dir.mkdir(exist_ok=True)
+        log_filename = log_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(file_handler)
 
 # ========== 可滚动框架 ==========
 class ScrollableFrame(ttk.Frame):
@@ -68,7 +104,7 @@ class ScrollableFrame(ttk.Frame):
 
 # ========== 主窗口类 ==========
 class ConverterGUI:
-    VERSION = "1.0"
+    VERSION = "1.5"
     GITHUB_URL = "https://github.com/gmy771810930/Ebook2XTX"
 
     def __init__(self):
@@ -81,6 +117,8 @@ class ConverterGUI:
         self.input_dir = tk.StringVar(value=str(Path.cwd()))
         self.output_dir = tk.StringVar(value=str(Path.cwd()))
         self.format_var = tk.IntVar(value=1)
+        self.image_format_var = tk.StringVar(value="png")
+        self.ebook_format_var = tk.StringVar(value="epub")
         self.resolution_var = tk.IntVar(value=1)
         self.custom_width = tk.StringVar()
         self.custom_height = tk.StringVar()
@@ -96,6 +134,7 @@ class ConverterGUI:
         self.split_size_var = tk.IntVar(value=1)
         self.custom_split_size = tk.StringVar()
         self.gif_mode_var = tk.IntVar(value=1)
+        self.enable_file_log = tk.BooleanVar(value=False)
 
         # 动态控件引用
         self.custom_res_frame = None
@@ -104,15 +143,20 @@ class ConverterGUI:
         self.filename_frame = None
         self.split_frame = None
         self.split_custom_frame = None
+        self.image_format_frame = None
+        self.ebook_format_frame = None
 
         self.log_queue = queue.Queue()
-        setup_gui_logging(self.log_queue)
+        setup_gui_logging(self.log_queue, enable_file_log=False)
 
         self.build_ui()
         self.update_logs()
 
         self.convert_thread = None
         self.stop_conversion = False
+
+        self.text_choice_memory = None
+        self.mixed_choice_memory = None
 
     def build_ui(self):
         main_frame = ttk.Frame(self.root)
@@ -168,14 +212,24 @@ class ConverterGUI:
         about_btn = ttk.Button(btn_frame, text="关于", command=self.show_about)
         about_btn.pack(side=tk.LEFT, padx=5)
 
+        log_check_frame = ttk.Frame(progress_frame)
+        log_check_frame.pack(pady=2)
+        self.log_check = ttk.Checkbutton(log_check_frame, text="输出日志到 log 文件", variable=self.enable_file_log)
+        self.log_check.pack(side=tk.LEFT)
+
         self.toggle_custom_res()
         self.toggle_crop_sub()
         self.toggle_filename_visibility()
         self.toggle_split_visibility()
         self.toggle_split_custom()
+        self.toggle_image_format_visibility()
+        self.toggle_ebook_format_visibility()
 
         self.format_var.trace_add('write', lambda *_: self.toggle_filename_visibility())
         self.format_var.trace_add('write', lambda *_: self.toggle_split_visibility())
+        self.format_var.trace_add('write', lambda *_: self.toggle_image_format_visibility())
+        self.format_var.trace_add('write', lambda *_: self.toggle_ebook_format_visibility())
+        self.resolution_var.trace_add('write', lambda *_: self.toggle_stretch_visibility())
 
     def _build_option_panels(self, parent):
         left_col = ttk.Frame(parent)
@@ -192,6 +246,18 @@ class ConverterGUI:
         ttk.Radiobutton(format_frame, text="XTCH (2-bit 4级灰度容器)", variable=self.format_var, value=2).pack(anchor=tk.W)
         ttk.Radiobutton(format_frame, text="XTG (1-bit 黑白单页)", variable=self.format_var, value=3).pack(anchor=tk.W)
         ttk.Radiobutton(format_frame, text="XTH (2-bit 4级灰度单页)", variable=self.format_var, value=4).pack(anchor=tk.W)
+        ttk.Radiobutton(format_frame, text="图片格式", variable=self.format_var, value=5).pack(anchor=tk.W)
+        self.image_format_frame = ttk.Frame(format_frame)
+        ttk.Label(self.image_format_frame, text="格式:").pack(side=tk.LEFT)
+        ttk.Radiobutton(self.image_format_frame, text="JPEG", variable=self.image_format_var, value="jpg").pack(side=tk.LEFT)
+        ttk.Radiobutton(self.image_format_frame, text="PNG", variable=self.image_format_var, value="png").pack(side=tk.LEFT)
+        ttk.Radiobutton(self.image_format_frame, text="WebP", variable=self.image_format_var, value="webp").pack(side=tk.LEFT)
+        ttk.Radiobutton(self.image_format_frame, text="BMP", variable=self.image_format_var, value="bmp").pack(side=tk.LEFT)
+        ttk.Radiobutton(format_frame, text="电子书格式", variable=self.format_var, value=6).pack(anchor=tk.W)
+        self.ebook_format_frame = ttk.Frame(format_frame)
+        ttk.Label(self.ebook_format_frame, text="格式:").pack(side=tk.LEFT)
+        ttk.Radiobutton(self.ebook_format_frame, text="EPUB", variable=self.ebook_format_var, value="epub").pack(side=tk.LEFT)
+        ttk.Radiobutton(self.ebook_format_frame, text="PDF", variable=self.ebook_format_var, value="pdf").pack(side=tk.LEFT)
 
         res_frame = ttk.LabelFrame(left_col, text="目标分辨率", padding="5")
         res_frame.pack(fill=tk.X, pady=5)
@@ -199,8 +265,8 @@ class ConverterGUI:
         ttk.Radiobutton(res_frame, text="X4 双倍 (960×1600)", variable=self.resolution_var, value=2).pack(anchor=tk.W)
         ttk.Radiobutton(res_frame, text="X3 (528×792)", variable=self.resolution_var, value=3).pack(anchor=tk.W)
         ttk.Radiobutton(res_frame, text="X3 双倍 (1056×1584)", variable=self.resolution_var, value=4).pack(anchor=tk.W)
-        ttk.Radiobutton(res_frame, text="自定义", variable=self.resolution_var, value=5,
-                        command=self.toggle_custom_res).pack(anchor=tk.W)
+        ttk.Radiobutton(res_frame, text="原分辨率", variable=self.resolution_var, value=5).pack(anchor=tk.W)
+        ttk.Radiobutton(res_frame, text="自定义", variable=self.resolution_var, value=6, command=self.toggle_custom_res).pack(anchor=tk.W)
         self.custom_res_frame = ttk.Frame(res_frame)
         ttk.Label(self.custom_res_frame, text="宽:").pack(side=tk.LEFT)
         ttk.Entry(self.custom_res_frame, textvariable=self.custom_width, width=8).pack(side=tk.LEFT, padx=2)
@@ -216,17 +282,15 @@ class ConverterGUI:
         ttk.Radiobutton(rot_sub, text="顺时针90°", variable=self.rotate_var, value=1).pack(side=tk.LEFT)
         ttk.Radiobutton(rot_sub, text="逆时针90°", variable=self.rotate_var, value=2).pack(side=tk.LEFT)
         ttk.Radiobutton(rot_sub, text="不旋转", variable=self.rotate_var, value=3).pack(side=tk.LEFT)
-        ttk.Checkbutton(opt_frame, text="拉伸至全屏", variable=self.stretch_var).pack(anchor=tk.W)
+        self.stretch_check = ttk.Checkbutton(opt_frame, text="拉伸至全屏", variable=self.stretch_var)
+        self.stretch_check.pack(anchor=tk.W)
 
         # 右侧列
         crop_frame = ttk.LabelFrame(right_col, text="画面切割", padding="5")
         crop_frame.pack(fill=tk.X, pady=5)
-        ttk.Radiobutton(crop_frame, text="不切割", variable=self.crop_mode_var, value=1,
-                        command=self.toggle_crop_sub).pack(anchor=tk.W)
-        ttk.Radiobutton(crop_frame, text="横切2图", variable=self.crop_mode_var, value=2,
-                        command=self.toggle_crop_sub).pack(anchor=tk.W)
-        ttk.Radiobutton(crop_frame, text="横切3图", variable=self.crop_mode_var, value=3,
-                        command=self.toggle_crop_sub).pack(anchor=tk.W)
+        ttk.Radiobutton(crop_frame, text="不切割", variable=self.crop_mode_var, value=1, command=self.toggle_crop_sub).pack(anchor=tk.W)
+        ttk.Radiobutton(crop_frame, text="横切2图", variable=self.crop_mode_var, value=2, command=self.toggle_crop_sub).pack(anchor=tk.W)
+        ttk.Radiobutton(crop_frame, text="横切3图", variable=self.crop_mode_var, value=3, command=self.toggle_crop_sub).pack(anchor=tk.W)
         self.crop_sub_frame = ttk.Frame(crop_frame)
         self.overlap_frame = ttk.Frame(crop_frame)
 
@@ -254,26 +318,42 @@ class ConverterGUI:
 
         self.filename_frame = ttk.LabelFrame(right_col, text="单页文件名格式", padding="5")
         ttk.Radiobutton(self.filename_frame, text="编号 (例如 1.xtg)", variable=self.filename_format_var, value=1).pack(anchor=tk.W)
-        ttk.Radiobutton(self.filename_frame, text="漫画名-编号 (例如 漫画名-1.xtg)", variable=self.filename_format_var, value=2).pack(anchor=tk.W)
+        ttk.Radiobutton(self.filename_frame, text="电子书名-编号 (例如 电子书名-1.xtg)", variable=self.filename_format_var, value=2).pack(anchor=tk.W)
 
         self.split_frame = ttk.LabelFrame(right_col, text="容器分包大小", padding="5")
-        ttk.Radiobutton(self.split_frame, text="4GB (FAT32)", variable=self.split_size_var, value=1,
-                        command=self.toggle_split_custom).pack(anchor=tk.W)
-        ttk.Radiobutton(self.split_frame, text="自定义", variable=self.split_size_var, value=2,
-                        command=self.toggle_split_custom).pack(anchor=tk.W)
-        ttk.Radiobutton(self.split_frame, text="不分包", variable=self.split_size_var, value=3,
-                        command=self.toggle_split_custom).pack(anchor=tk.W)
+        ttk.Radiobutton(self.split_frame, text="4GB (FAT32)", variable=self.split_size_var, value=1, command=self.toggle_split_custom).pack(anchor=tk.W)
+        ttk.Radiobutton(self.split_frame, text="自定义", variable=self.split_size_var, value=2, command=self.toggle_split_custom).pack(anchor=tk.W)
+        ttk.Radiobutton(self.split_frame, text="不分包", variable=self.split_size_var, value=3, command=self.toggle_split_custom).pack(anchor=tk.W)
         self.split_custom_frame = ttk.Frame(self.split_frame)
         ttk.Label(self.split_custom_frame, text="大小:").pack(side=tk.LEFT)
         ttk.Entry(self.split_custom_frame, textvariable=self.custom_split_size, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.split_custom_frame, text="(支持 k/KB/m/MB/g/GB，默认MB)").pack(side=tk.LEFT)
 
+    # 控件可见性控制
+    def toggle_image_format_visibility(self):
+        if self.format_var.get() == 5:
+            self.image_format_frame.pack(anchor=tk.W, padx=20, pady=2)
+        else:
+            self.image_format_frame.pack_forget()
+
+    def toggle_ebook_format_visibility(self):
+        if self.format_var.get() == 6:
+            self.ebook_format_frame.pack(anchor=tk.W, padx=20, pady=2)
+        else:
+            self.ebook_format_frame.pack_forget()
+
+    def toggle_stretch_visibility(self):
+        if self.resolution_var.get() == 5:
+            self.stretch_check.config(state=tk.DISABLED)
+            self.stretch_var.set(False)
+        else:
+            self.stretch_check.config(state=tk.NORMAL)
+
     def toggle_custom_res(self):
-        if self.custom_res_frame:
-            if self.resolution_var.get() == 5:
-                self.custom_res_frame.pack(anchor=tk.W, padx=20, pady=2)
-            else:
-                self.custom_res_frame.pack_forget()
+        if self.resolution_var.get() == 6:
+            self.custom_res_frame.pack(anchor=tk.W, padx=20, pady=2)
+        else:
+            self.custom_res_frame.pack_forget()
 
     def toggle_crop_sub(self):
         for widget in self.crop_sub_frame.winfo_children():
@@ -285,8 +365,7 @@ class ConverterGUI:
                 self.crop_sub_var.set(1)
             ttk.Radiobutton(self.crop_sub_frame, text="1 : 1.618 (黄金比例)", variable=self.crop_sub_var, value=1).pack(anchor=tk.W)
             ttk.Radiobutton(self.crop_sub_frame, text="1.618 : 1", variable=self.crop_sub_var, value=2).pack(anchor=tk.W)
-            ttk.Radiobutton(self.crop_sub_frame, text="1 : 1 (上下等分，滚动模式)", variable=self.crop_sub_var, value=3,
-                            command=self.toggle_overlap).pack(anchor=tk.W)
+            ttk.Radiobutton(self.crop_sub_frame, text="1 : 1 (上下等分，滚动模式)", variable=self.crop_sub_var, value=3, command=self.toggle_overlap).pack(anchor=tk.W)
             self.crop_sub_frame.pack(anchor=tk.W, padx=20, pady=2)
             self.toggle_overlap()
         elif mode == 3:
@@ -295,8 +374,7 @@ class ConverterGUI:
             ttk.Radiobutton(self.crop_sub_frame, text="1 : 2 : 1", variable=self.crop_sub_var, value=1).pack(anchor=tk.W)
             ttk.Radiobutton(self.crop_sub_frame, text="2 : 1 : 1", variable=self.crop_sub_var, value=2).pack(anchor=tk.W)
             ttk.Radiobutton(self.crop_sub_frame, text="1 : 1 : 2", variable=self.crop_sub_var, value=3).pack(anchor=tk.W)
-            ttk.Radiobutton(self.crop_sub_frame, text="1 : 1 : 1 (5图滚动模式)", variable=self.crop_sub_var, value=4,
-                            command=self.toggle_overlap).pack(anchor=tk.W)
+            ttk.Radiobutton(self.crop_sub_frame, text="1 : 1 : 1 (5图滚动模式)", variable=self.crop_sub_var, value=4, command=self.toggle_overlap).pack(anchor=tk.W)
             self.crop_sub_frame.pack(anchor=tk.W, padx=20, pady=2)
             self.toggle_overlap()
         else:
@@ -314,13 +392,13 @@ class ConverterGUI:
             self.overlap_frame.pack(anchor=tk.W, padx=20, pady=2)
 
     def toggle_filename_visibility(self):
-        if self.format_var.get() in (3, 4):
+        if self.format_var.get() in (3,4,5):
             self.filename_frame.pack(fill=tk.X, pady=5)
         else:
             self.filename_frame.pack_forget()
 
     def toggle_split_visibility(self):
-        if self.format_var.get() in (1, 2):
+        if self.format_var.get() in (1,2):
             self.split_frame.pack(fill=tk.X, pady=5)
         else:
             self.split_frame.pack_forget()
@@ -332,7 +410,7 @@ class ConverterGUI:
             self.split_custom_frame.pack_forget()
 
     def browse_input(self):
-        dirname = filedialog.askdirectory(title="选择包含压缩包的目录", initialdir=self.input_dir.get())
+        dirname = filedialog.askdirectory(title="选择包含输入文件的目录", initialdir=self.input_dir.get())
         if dirname:
             self.input_dir.set(dirname)
 
@@ -344,24 +422,26 @@ class ConverterGUI:
     def get_resolution(self):
         res = self.resolution_var.get()
         if res == 1:
-            return 480, 800
+            return "preset", (480, 800)
         elif res == 2:
-            return 960, 1600
+            return "preset", (960, 1600)
         elif res == 3:
-            return 528, 792
+            return "preset", (528, 792)
         elif res == 4:
-            return 1056, 1584
+            return "preset", (1056, 1584)
+        elif res == 5:
+            return "original", None
         else:
             try:
                 w = int(self.custom_width.get())
                 h = int(self.custom_height.get())
                 if w > 0 and h > 0:
-                    return w, h
+                    return "custom", (w, h)
                 else:
                     raise ValueError
             except:
                 messagebox.showerror("错误", "自定义分辨率格式错误，使用默认 X4 (480x800)")
-                return 480, 800
+                return "preset", (480, 800)
 
     def get_crop_settings(self):
         mode = self.crop_mode_var.get()
@@ -406,25 +486,35 @@ class ConverterGUI:
             return 0
 
     def build_settings(self):
-        width, height = self.get_resolution()
+        res_type, res_value = self.get_resolution()
         rotate_map = {1: "clockwise", 2: "counterclockwise", 3: "none"}
         rotate_mode = rotate_map[self.rotate_var.get()]
-        fmt_map = {1: "xtc", 2: "xtch", 3: "xtg", 4: "xth"}
-        output_format = fmt_map[self.format_var.get()]
-        return {
-            'format': output_format,
-            'width': width,
-            'height': height,
+        fmt = self.format_var.get()
+        if fmt == 5:
+            out_type = "image"
+            out_value = self.image_format_var.get()
+        elif fmt == 6:
+            out_type = "ebook"
+            out_value = self.ebook_format_var.get()
+        else:
+            out_type = "format"
+            out_value = {1: "xtc", 2: "xtch", 3: "xtg", 4: "xth"}[fmt]
+        settings = {
+            'out_type': out_type,
+            'out_value': out_value,
+            'res_type': res_type,
+            'res_value': res_value,
             'auto_crop': self.auto_crop_var.get(),
             'rotate_mode': rotate_mode,
             'crop': self.get_crop_settings(),
-            'stretch': self.stretch_var.get(),
+            'stretch': self.stretch_var.get() if res_type != "original" else False,
             'dither_strength': self.dither_strength.get(),
             'max_workers': self.max_workers.get(),
-            'filename_format': self.filename_format_var.get() - 1 if output_format in ('xtg', 'xth') else None,
-            'split_size': self.get_split_size() if output_format in ('xtc', 'xtch') else None,
+            'filename_format': self.filename_format_var.get() - 1 if out_type == "image" or (out_type == "format" and out_value in ('xtg','xth')) else None,
+            'split_size': self.get_split_size() if out_type == "format" and out_value in ('xtc','xtch') else None,
             'gif_mode': self.gif_mode_var.get()
         }
+        return settings
 
     def start_conversion(self):
         input_dir = self.input_dir.get().strip()
@@ -432,10 +522,11 @@ class ConverterGUI:
         if not input_dir or not output_dir:
             messagebox.showerror("错误", "请选择输入和输出目录")
             return
-        # 修正依赖检查调用
-        if not ebook2xtx.check_and_install_dependencies():
+        if not check_and_install_dependencies():
             messagebox.showerror("错误", "依赖安装失败，请手动安装后再试")
             return
+
+        setup_gui_logging(self.log_queue, enable_file_log=self.enable_file_log.get())
 
         settings = self.build_settings()
         self.stop_conversion = False
@@ -446,20 +537,174 @@ class ConverterGUI:
         self.file_progress['value'] = 0
         self.file_label.config(text="当前文件: 0/0 (0%)")
 
+        self.text_choice_memory = None
+        self.mixed_choice_memory = None
+
         def run():
             try:
-                success = convert_archives(Path(input_dir), Path(output_dir), settings,
-                                           overall_progress_callback=self.update_progress)
-                self.root.after(0, self.conversion_finished, success)
+                items = scan_input_items(Path(input_dir))
+                if not items:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "未找到任何可转换的内容"))
+                    return
+
+                processed_items = []
+                for item in items:
+                    if self.stop_conversion:
+                        logging.info("用户停止转换")
+                        break
+
+                    if item.doc_type == 'comic':
+                        self.root.after(0, lambda: self.log_text_insert(f"本书为纯图片电子书\n"))
+                        logging.info(f"本书为纯图片电子书: {item.name}")
+                        processed_items.append(item)
+                    elif item.doc_type == 'text':
+                        self.root.after(0, lambda: self.log_text_insert(f"本书为纯文本电子书，建议直接打开阅读，不建议转换！\n"))
+                        logging.info(f"本书为纯文本电子书: {item.name}")
+                        if self.text_choice_memory is None:
+                            event = threading.Event()
+                            result = [False]
+                            def ask():
+                                resp = messagebox.askyesno("纯文本电子书", "本书为纯文本电子书，建议直接打开阅读，不建议转换！\n是否输出为TXT文件？")
+                                result[0] = resp
+                                event.set()
+                            self.root.after(0, ask)
+                            event.wait()
+                            self.text_choice_memory = result[0]
+                        if self.text_choice_memory:
+                            logging.info(f"用户选择转换为 TXT: {item.name}")
+                            txt = item.get_text()
+                            if txt:
+                                txt_path = Path(output_dir) / f"{sanitize_filename(item.name)}.txt"
+                                txt_path.write_text(txt, encoding='utf-8')
+                                self.root.after(0, lambda: self.log_text_insert(f"已保存 TXT 文件: {txt_path}\n"))
+                                logging.info(f"已保存 TXT 文件: {txt_path}")
+                            else:
+                                self.root.after(0, lambda: self.log_text_insert(f"提取文本失败: {item.name}\n"))
+                                logging.error(f"提取文本失败: {item.name}")
+                        else:
+                            logging.info(f"用户选择跳过: {item.name}")
+                    else:  # mixed
+                        self.root.after(0, lambda: self.log_text_insert(f"本书为图文混排电子书，本工具暂不支持转换，建议使用其他工具转换为PDF格式后再使用本工具转换！\n"))
+                        logging.info(f"本书为图文混排电子书: {item.name}")
+                        if self.mixed_choice_memory is None:
+                            event = threading.Event()
+                            choice = [0]
+                            def ask_mixed():
+                                dialog = tk.Toplevel(self.root)
+                                dialog.title("图文混排电子书")
+                                dialog.geometry("500x200")
+                                dialog.transient(self.root)
+                                dialog.grab_set()
+                                label = ttk.Label(dialog, text="本书为图文混排电子书，本工具暂不支持直接转换。\n请选择操作：")
+                                label.pack(pady=10)
+                                var = tk.IntVar(value=0)
+                                ttk.Radiobutton(dialog, text="不转换", variable=var, value=0).pack(anchor=tk.W, padx=20)
+                                ttk.Radiobutton(dialog, text="仅转换图片（提取内嵌图片）", variable=var, value=1).pack(anchor=tk.W, padx=20)
+                                ttk.Radiobutton(dialog, text="仅转换文本（输出TXT文件）", variable=var, value=2).pack(anchor=tk.W, padx=20)
+                                def confirm():
+                                    choice[0] = var.get()
+                                    dialog.destroy()
+                                    event.set()
+                                ttk.Button(dialog, text="确定", command=confirm).pack(pady=10)
+                                dialog.protocol("WM_DELETE_WINDOW", confirm)
+                            self.root.after(0, ask_mixed)
+                            event.wait()
+                            self.mixed_choice_memory = choice[0]
+                        if self.mixed_choice_memory == 1:
+                            logging.info(f"用户选择仅转换图片: {item.name}")
+                            processed_items.append(item)
+                        elif self.mixed_choice_memory == 2:
+                            logging.info(f"用户选择仅转换文本: {item.name}")
+                            txt = item.get_text()
+                            if txt:
+                                txt_path = Path(output_dir) / f"{sanitize_filename(item.name)}.txt"
+                                txt_path.write_text(txt, encoding='utf-8')
+                                self.root.after(0, lambda: self.log_text_insert(f"已保存 TXT 文件: {txt_path}\n"))
+                                logging.info(f"已保存 TXT 文件: {txt_path}")
+                            else:
+                                self.root.after(0, lambda: self.log_text_insert(f"提取文本失败: {item.name}\n"))
+                                logging.error(f"提取文本失败: {item.name}")
+                        else:
+                            logging.info(f"用户选择跳过: {item.name}")
+
+                if processed_items and not self.stop_conversion:
+                    total = len(processed_items)
+                    success_count = 0
+                    for idx, item in enumerate(processed_items):
+                        if self.stop_conversion:
+                            break
+                        self.root.after(0, lambda: self._update_progress_ui(item.name, idx+1, total))
+                        # 准备 local_settings
+                        local_settings = settings.copy()
+                        if settings['res_type'] == 'original':
+                            local_settings['width'] = 0
+                            local_settings['height'] = 0
+                            local_settings['stretch'] = False
+                        else:
+                            w, h = settings['res_value']
+                            local_settings['width'] = w
+                            local_settings['height'] = h
+                        # 获取图片
+                        images = item.get_images()
+                        if not images:
+                            logging.error(f"没有找到任何图像: {item.name}")
+                            continue
+                        # 根据输出类型处理
+                        if settings['out_type'] == 'ebook':
+                            if process_images_to_ebook(images, item.name, local_settings, Path(output_dir)):
+                                success_count += 1
+                            else:
+                                logging.error(f"处理失败: {item.name}")
+                        else:
+                            if process_images(images, item.name, local_settings, Path(output_dir)):
+                                success_count += 1
+                            else:
+                                logging.error(f"处理失败: {item.name}")
+                    self.root.after(0, self.conversion_finished, success_count, total)
+                else:
+                    self.root.after(0, lambda: messagebox.showinfo("完成", "没有需要转换的项目"))
+                    self.root.after(0, self.conversion_finished, 0, 0)
             except Exception as e:
                 logging.exception("转换过程异常")
                 self.root.after(0, self.conversion_error, str(e))
+            finally:
+                self.root.after(0, self._reset_ui)
 
         self.convert_thread = threading.Thread(target=run)
         self.convert_thread.start()
 
-    def update_progress(self, archive_name, current, total):
-        self.root.after(0, lambda: self._update_progress_ui(archive_name, current, total))
+    def _reset_ui(self):
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+
+    def conversion_error(self, error_msg):
+        self._reset_ui()
+        self.total_label.config(text="转换出错")
+        messagebox.showerror("错误", f"转换过程中发生错误:\n{error_msg}")
+
+    def conversion_finished(self, success_count, total):
+        self._reset_ui()
+        if total > 0:
+            self.total_label.config(text=f"转换完成，成功处理 {success_count} 个文件")
+            self.total_progress['value'] = 100
+            messagebox.showinfo("完成", f"转换完成！成功处理 {success_count}/{total} 个文件。")
+        else:
+            self.total_label.config(text="转换完成，没有需要转换的项目")
+            self.total_progress['value'] = 100
+        self.file_label.config(text="完成")
+        self.file_progress['value'] = 100
+
+    def stop_conversion_cmd(self):
+        self.stop_conversion = True
+        self.stop_btn.config(state=tk.DISABLED)
+        self.total_label.config(text="正在停止（可能需要等待当前任务完成）...")
+        messagebox.showinfo("提示", "停止操作将等待当前图片处理完成，请稍后。")
+
+    def log_text_insert(self, text):
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.insert(tk.END, text)
+        self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
 
     def _update_progress_ui(self, archive_name, current, total):
         if total > 0:
@@ -470,27 +715,6 @@ class ConverterGUI:
             self.total_progress['value'] = 0
             self.total_label.config(text="总进度: 准备中...")
         self.file_label.config(text=f"当前文件: {archive_name} ({current}/{total})")
-
-    def conversion_finished(self, success_count):
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.total_label.config(text=f"转换完成，成功处理 {success_count} 个压缩包")
-        self.total_progress['value'] = 100
-        self.file_label.config(text="完成")
-        self.file_progress['value'] = 100
-        messagebox.showinfo("完成", f"转换完成！成功处理 {success_count} 个压缩包。")
-
-    def conversion_error(self, error_msg):
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.total_label.config(text="转换出错")
-        messagebox.showerror("错误", f"转换过程中发生错误:\n{error_msg}")
-
-    def stop_conversion_cmd(self):
-        self.stop_conversion = True
-        self.stop_btn.config(state=tk.DISABLED)
-        self.total_label.config(text="正在停止（可能需要等待当前任务完成）...")
-        messagebox.showinfo("提示", "停止操作可能需要等待当前图片处理完成，请耐心等待。")
 
     def update_logs(self):
         try:
@@ -520,7 +744,7 @@ class ConverterGUI:
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text="Ebook2XTX", font=("微软雅黑", 16, "bold")).pack(pady=5)
         ttk.Label(frame, text=f"版本 {self.VERSION}").pack(pady=2)
-        ttk.Label(frame, text="漫画电子书格式转换工具").pack(pady=2)
+        ttk.Label(frame, text="电子书/文档转 Xteink 设备格式工具").pack(pady=2)
         link_frame = ttk.Frame(frame)
         link_frame.pack(pady=10)
         ttk.Label(link_frame, text="GitHub: ").pack(side=tk.LEFT)
