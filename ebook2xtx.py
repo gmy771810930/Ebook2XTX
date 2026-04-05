@@ -1140,7 +1140,7 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
         pages_data_list = [None] * total
         failed_images = []
         args_list = [(img_path, idx, total, settings) for idx, img_path in enumerate(img_paths)]
-        with ProcessPoolExecutor(max_workers=max_workers, initializer=init_worker) as executor:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_process_single_image, args) for args in args_list]
             completed_count = 0
             for future in as_completed(futures):
