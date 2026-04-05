@@ -50,7 +50,6 @@ def ensure_dependencies():
 
 ensure_dependencies()
 
-# 导入转换模块（只导入需要的函数，不导入 convert_items）
 from ebook2xtx import (
     parse_size_string, check_and_install_dependencies, scan_input_items,
     InputItem, sanitize_filename, process_images, process_images_to_ebook
@@ -315,6 +314,7 @@ class ConverterGUI:
         gif_frame.pack(fill=tk.X, pady=5)
         ttk.Radiobutton(gif_frame, text="只处理第一帧", variable=self.gif_mode_var, value=1).pack(anchor=tk.W)
         ttk.Radiobutton(gif_frame, text="处理所有帧", variable=self.gif_mode_var, value=2).pack(anchor=tk.W)
+        ttk.Radiobutton(gif_frame, text="跳过 GIF 文件（不转换）", variable=self.gif_mode_var, value=3).pack(anchor=tk.W)
 
         self.filename_frame = ttk.LabelFrame(right_col, text="单页文件名格式", padding="5")
         ttk.Radiobutton(self.filename_frame, text="编号 (例如 1.xtg)", variable=self.filename_format_var, value=1).pack(anchor=tk.W)
@@ -476,12 +476,13 @@ class ConverterGUI:
         elif choice == 2:
             size_str = self.custom_split_size.get().strip()
             if not size_str:
-                return 0
+                messagebox.showerror("错误", "请输入自定义分包大小")
+                return None
             try:
                 return parse_size_string(size_str)
             except ValueError as e:
                 messagebox.showerror("错误", f"分包大小格式错误: {e}")
-                return 0
+                return None
         else:
             return 0
 
@@ -499,6 +500,11 @@ class ConverterGUI:
         else:
             out_type = "format"
             out_value = {1: "xtc", 2: "xtch", 3: "xtg", 4: "xth"}[fmt]
+        split_size = None
+        if out_type == "format" and out_value in ('xtc', 'xtch'):
+            split_size = self.get_split_size()
+            if split_size is None:
+                return None   # 自定义分包大小无效
         settings = {
             'out_type': out_type,
             'out_value': out_value,
@@ -511,7 +517,7 @@ class ConverterGUI:
             'dither_strength': self.dither_strength.get(),
             'max_workers': self.max_workers.get(),
             'filename_format': self.filename_format_var.get() - 1 if out_type == "image" or (out_type == "format" and out_value in ('xtg','xth')) else None,
-            'split_size': self.get_split_size() if out_type == "format" and out_value in ('xtc','xtch') else None,
+            'split_size': split_size,
             'gif_mode': self.gif_mode_var.get()
         }
         return settings
@@ -526,9 +532,12 @@ class ConverterGUI:
             messagebox.showerror("错误", "依赖安装失败，请手动安装后再试")
             return
 
+        settings = self.build_settings()
+        if settings is None:
+            return  # 分包大小无效，已弹出错误
+
         setup_gui_logging(self.log_queue, enable_file_log=self.enable_file_log.get())
 
-        settings = self.build_settings()
         self.stop_conversion = False
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -634,7 +643,6 @@ class ConverterGUI:
                         if self.stop_conversion:
                             break
                         self.root.after(0, lambda: self._update_progress_ui(item.name, idx+1, total))
-                        # 准备 local_settings
                         local_settings = settings.copy()
                         if settings['res_type'] == 'original':
                             local_settings['width'] = 0
@@ -644,12 +652,10 @@ class ConverterGUI:
                             w, h = settings['res_value']
                             local_settings['width'] = w
                             local_settings['height'] = h
-                        # 获取图片
                         images = item.get_images()
                         if not images:
                             logging.error(f"没有找到任何图像: {item.name}")
                             continue
-                        # 根据输出类型处理
                         if settings['out_type'] == 'ebook':
                             if process_images_to_ebook(images, item.name, local_settings, Path(output_dir)):
                                 success_count += 1

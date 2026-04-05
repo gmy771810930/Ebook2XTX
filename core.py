@@ -48,15 +48,18 @@ def floyd_steinberg_dither_numba(gray_arr: np.ndarray, bits: int, strength: floa
 def fill_transparent_with_white(img: Image.Image) -> Image.Image:
     """
     将图片中的透明区域填充为白色（RGB 255,255,255）
-    支持 RGBA、LA 以及带透明通道的索引色（P）模式
+    支持 RGBA、LA、P 以及任何可能含有透明的模式
     """
-    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
-        if img.mode == 'P':
-            img = img.convert('RGBA')
-        background = Image.new('RGBA', img.size, (255, 255, 255, 255))
-        img = Image.alpha_composite(background, img)
-        img = img.convert('RGB')
-        logger.debug("透明区域已填充为白色")
+    # 先转为 RGBA（如果是 P 模式且无透明度，也会转为不透明的 RGBA）
+    if img.mode != 'RGBA':
+        img = img.convert('RGBA')
+    # 创建白色背景
+    background = Image.new('RGBA', img.size, (255, 255, 255, 255))
+    # 合成（alpha_composite 会正确处理透明区域）
+    img = Image.alpha_composite(background, img)
+    # 转回 RGB（去除 alpha 通道）
+    img = img.convert('RGB')
+    logger.debug("透明区域已填充为白色")
     return img
 
 # ========== 图像处理 ==========
@@ -123,7 +126,7 @@ def split_image_vertically(img: Image.Image, parts: int, ratios: Tuple[float, ..
         splits[-1] = last
     return splits
 
-# ========== 滚动切割函数 ==========
+# ========== 滚动切割函数==========
 def split_rolling_2(img: Image.Image, overlap_percent: int) -> List[Image.Image]:
     """
     横切2图滚动模式（输出3张图）
@@ -131,6 +134,11 @@ def split_rolling_2(img: Image.Image, overlap_percent: int) -> List[Image.Image]
                     0%时三图近似等分，相邻重叠1像素。
     """
     H = img.height
+    # 如果高度太小，不切割，直接返回原图
+    if H < 50:
+        logger.warning(f"图片高度 {H} 过小，无法进行滚动切割，将使用原图")
+        return [img]
+
     t = overlap_percent / 100.0
 
     h_max = H / 2.0
@@ -180,6 +188,11 @@ def split_rolling_3(img: Image.Image, overlap_percent: int) -> List[Image.Image]
                     0%时五张图近似等分，相邻重叠1像素。
     """
     H = img.height
+    # 如果高度太小，不切割，直接返回原图
+    if H < 50:
+        logger.warning(f"图片高度 {H} 过小，无法进行滚动切割，将使用原图")
+        return [img]
+
     t = overlap_percent / 100.0
 
     h_max = H / 3.0
@@ -364,7 +377,7 @@ def _process_single_frame(img: Image.Image, idx: int, total: int, settings: dict
         # 对所有图片（或子图）进行缩放/拉伸
         encoded_pages = []
         for part_img in splits:
-            # 修复：如果目标尺寸为0，则跳过缩放
+            #如果目标尺寸为0，则跳过缩放
             target_w = settings['width']
             target_h = settings['height']
             if target_w > 0 and target_h > 0:

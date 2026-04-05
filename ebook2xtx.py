@@ -320,6 +320,10 @@ def get_user_settings():
     split_size = None
     if out_type == "format" and out_value in ('xtc', 'xtch'):
         split_size = get_split_size()
+    # GIF 处理选项
+    print("\nGIF 动图处理方式：")
+    gif_options = {1: "只处理第一帧", 2: "处理所有帧", 3: "跳过 GIF 文件（不转换）"}
+    gif_mode = get_user_choice("请选择：", gif_options, 1)
     return {
         'out_type': out_type,
         'out_value': out_value,
@@ -332,7 +336,8 @@ def get_user_settings():
         'dither_strength': dither_strength,
         'max_workers': max_workers,
         'filename_format': filename_format,
-        'split_size': split_size
+        'split_size': split_size,
+        'gif_mode': gif_mode
     }
 
 # ---------- 电子书处理辅助函数 ----------
@@ -474,6 +479,7 @@ class XTCReader:
         self.title = ""
         self.author = ""
         self.is_hq = False
+        self.chapters = []          # 初始化章节列表
         self.f = None
         ext = os.path.splitext(filepath)[1].lower()
         if ext in ('.xtc', '.xtch'):
@@ -517,7 +523,7 @@ class XTCReader:
         files = []
         for ext in ('.xtg', '.xth'):
             files.extend(Path(dir_path).glob(f'*{ext}'))
-        files = sorted(files, key=lambda p: p.name)
+        files = natsorted(files, key=lambda p: p.name)   # 自然排序
         if not files:
             raise ValueError(f"目录 {dir_path} 中没有找到 .xtg 或 .xth 文件")
         self.page_files = [str(f) for f in files]
@@ -769,7 +775,7 @@ def extract_images_from_single_pages(dir_path: Path) -> List[Image.Image]:
     files = []
     for ext in ('.xtg', '.xth'):
         files.extend(dir_path.glob(f'*{ext}'))
-    files = sorted(files, key=lambda p: p.name)
+    files = natsorted(files, key=lambda p: p.name)   # 自然排序
     images = []
     for f in files:
         with open(f, 'rb') as fp:
@@ -859,7 +865,7 @@ def collect_images(extract_dir: Path) -> List[Path]:
                 images.append(Path(root) / f)
     return natsorted(images)
 
-def build_xtc_container(pages_data: List[bytes], title: str, author: str, width: int, height: int, is_hq: bool) -> bytes:
+def build_xtc_container(pages_data: List[bytes], title: str, author: str, width: int, height: int, is_hq: bool, page_dimensions: List[Tuple[int,int]] = None) -> bytes:
     page_count = len(pages_data)
     magic = b'XTCH' if is_hq else b'XTC\0'
     header_size = 56
@@ -882,10 +888,14 @@ def build_xtc_container(pages_data: List[bytes], title: str, author: str, width:
     for i, page_data in enumerate(pages_data):
         offset = current_offset
         size = len(page_data)
+        if page_dimensions and i < len(page_dimensions):
+            w, h = page_dimensions[i]
+        else:
+            w, h = width, height
         struct.pack_into('<Q', index_table, i*16, offset)
         struct.pack_into('<I', index_table, i*16+8, size)
-        struct.pack_into('<H', index_table, i*16+12, width)
-        struct.pack_into('<H', index_table, i*16+14, height)
+        struct.pack_into('<H', index_table, i*16+12, w)
+        struct.pack_into('<H', index_table, i*16+14, h)
         current_offset += size
     header = bytearray(header_size)
     header[:4] = magic
@@ -990,24 +1000,50 @@ def process_images_to_ebook(images: List[Image.Image], title: str, settings: dic
         logger.error(f"不支持的电子书格式: {out_format}")
         return False
 
+def init_worker():
+    # 子进程日志初始化，避免日志混乱
+    logging.getLogger().handlers.clear()
+    logging.getLogger().addHandler(logging.NullHandler())
+
 def process_images(images: List[Image.Image], title: str, settings: dict, output_base_dir: Path,
                    progress_callback: Optional[Callable[[str, int, int], None]] = None) -> bool:
+    # 处理 GIF 多帧/跳过选项
+    gif_mode = settings.get('gif_mode', 1)
+    new_images = []
+    for img in images:
+        is_animated = getattr(img, 'is_animated', False)
+        n_frames = getattr(img, 'n_frames', 1)
+        if is_animated and n_frames > 1:
+            if gif_mode == 3:
+                logger.info(f"跳过 GIF 动图: {title}")
+                continue
+            elif gif_mode == 2:
+                frames = []
+                try:
+                    img.seek(0)
+                    for frame_idx in range(n_frames):
+                        img.seek(frame_idx)
+                        frames.append(img.copy())
+                except Exception as e:
+                    logger.error(f"展开 GIF 帧失败: {e}")
+                    frames = [img.copy()]
+                new_images.extend(frames)
+                continue
+        new_images.append(img)
+    images = new_images
     total = len(images)
     logger.info(f"处理电子书 {title}，共 {total} 张图片")
     max_workers = settings['max_workers']
     logger.info(f"使用 {max_workers} 个进程并行处理图片")
 
-    # ========== 修复：为 settings 添加 'format' 键 ==========
-    # 根据输出类型推断位深，设置 format 供 core.py 使用
     out_type = settings.get('out_type')
     out_value = settings.get('out_value')
-    # 如果输出是 2-bit 格式（XTCH 或 XTH），则使用 xth，否则使用 xtg（1-bit）
     if out_type == 'format' and out_value in ('xtch', 'xth'):
         bits = 2
     else:
         bits = 1
     settings['format'] = 'xth' if bits == 2 else 'xtg'
-    # ========== 修复结束 ==========
+    is_1bit = (settings['format'] == 'xtg')
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
@@ -1021,7 +1057,7 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
         pages_data_list = [None] * total
         failed_images = []
         args_list = [(img_path, idx, total, settings) for idx, img_path in enumerate(img_paths)]
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        with ProcessPoolExecutor(max_workers=max_workers, initializer=init_worker) as executor:
             futures = [executor.submit(_process_single_image, args) for args in args_list]
             completed_count = 0
             for future in as_completed(futures):
@@ -1037,9 +1073,9 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
                 if progress_callback:
                     progress_callback(title, completed_count, total)
         if failed_images:
-            logger.error(f"共有 {len(failed_images)} 张图片处理失败:")
-            for idx, img, err in failed_images:
-                logger.error(f"  #{idx+1}: {img} - {err}")
+            error_msg = f"处理失败，共 {len(failed_images)} 张图片失败，页码索引: {[idx for idx, _, _ in failed_images]}。转换终止。"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
         pages_data = []
         for sublist in pages_data_list:
             if sublist is not None:
@@ -1054,7 +1090,7 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
             out_dir.mkdir(parents=True, exist_ok=True)
             ext = output_format
             for idx, page_data in enumerate(pages_data):
-                if settings.get('original_format') in ('xtc', 'xtg'):
+                if is_1bit:
                     img = XTCReader._decode_xtg(page_data)
                 else:
                     img = XTCReader._decode_xth(page_data)
@@ -1083,17 +1119,29 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
             parts = []
             current_part = []
             current_size = 0
-            for page in pages_data:
+            # 收集每页的实际宽高
+            page_dimensions = []
+            for page_data in pages_data:
+                if len(page_data) >= 8:
+                    w = struct.unpack('<H', page_data[4:6])[0]
+                    h = struct.unpack('<H', page_data[6:8])[0]
+                    page_dimensions.append((w, h))
+                else:
+                    page_dimensions.append((0, 0))
+            for idx, page in enumerate(pages_data):
                 page_size = len(page)
                 if split_size > 0 and current_part and current_size + page_size > split_size:
-                    container = build_xtc_container(current_part, base_name, author, settings['width'], settings['height'], is_hq)
+                    container = build_xtc_container(current_part, base_name, author, 0, 0, is_hq, page_dimensions[len(current_part_start_idx):idx] if 'current_part_start_idx' in locals() else None)
                     parts.append(container)
                     current_part = []
                     current_size = 0
+                    current_part_start_idx = idx
+                if not current_part:
+                    current_part_start_idx = idx
                 current_part.append(page)
                 current_size += page_size
             if current_part:
-                container = build_xtc_container(current_part, base_name, author, settings['width'], settings['height'], is_hq)
+                container = build_xtc_container(current_part, base_name, author, 0, 0, is_hq, page_dimensions[current_part_start_idx:])
                 parts.append(container)
             if len(parts) == 1:
                 output_path = output_base_dir / f"{base_name}{ext}"
@@ -1101,7 +1149,9 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
                 logger.info(f"输出文件: {output_path} ({len(parts[0])} bytes)")
             else:
                 for i, container in enumerate(parts, start=1):
-                    output_path = output_base_dir / f"{base_name}-{i}{ext}"
+                    filename = f"{base_name}-{i}{ext}"
+                    filename = sanitize_filename(filename)
+                    output_path = output_base_dir / filename
                     output_path.write_bytes(container)
                     logger.info(f"输出文件: {output_path} ({len(container)} bytes)")
         else:  # xtg or xth
