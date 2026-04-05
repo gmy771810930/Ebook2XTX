@@ -116,7 +116,7 @@ class ConverterGUI:
         self.input_dir = tk.StringVar(value=str(Path.cwd()))
         self.output_dir = tk.StringVar(value=str(Path.cwd()))
         self.format_var = tk.IntVar(value=1)
-        self.image_format_var = tk.StringVar(value="png")
+        self.image_format_var = tk.StringVar(value="jpg")   # 默认改为 jpg
         self.ebook_format_var = tk.StringVar(value="epub")
         self.resolution_var = tk.IntVar(value=1)
         self.custom_width = tk.StringVar()
@@ -156,6 +156,10 @@ class ConverterGUI:
 
         self.text_choice_memory = None
         self.mixed_choice_memory = None
+
+        # 添加图片格式变化的追踪，以便更新文件名示例
+        self.image_format_var.trace_add('write', lambda *_: self.update_filename_example())
+        self.format_var.trace_add('write', lambda *_: self.update_filename_example())
 
     def build_ui(self):
         main_frame = ttk.Frame(self.root)
@@ -317,8 +321,7 @@ class ConverterGUI:
         ttk.Radiobutton(gif_frame, text="跳过 GIF 文件（不转换）", variable=self.gif_mode_var, value=3).pack(anchor=tk.W)
 
         self.filename_frame = ttk.LabelFrame(right_col, text="单页文件名格式", padding="5")
-        ttk.Radiobutton(self.filename_frame, text="编号 (例如 1.xtg)", variable=self.filename_format_var, value=1).pack(anchor=tk.W)
-        ttk.Radiobutton(self.filename_frame, text="电子书名-编号 (例如 电子书名-1.xtg)", variable=self.filename_format_var, value=2).pack(anchor=tk.W)
+        # 内容动态填充，在 update_filename_example 中重建
 
         self.split_frame = ttk.LabelFrame(right_col, text="容器分包大小", padding="5")
         ttk.Radiobutton(self.split_frame, text="4GB (FAT32)", variable=self.split_size_var, value=1, command=self.toggle_split_custom).pack(anchor=tk.W)
@@ -328,6 +331,9 @@ class ConverterGUI:
         ttk.Label(self.split_custom_frame, text="大小:").pack(side=tk.LEFT)
         ttk.Entry(self.split_custom_frame, textvariable=self.custom_split_size, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.split_custom_frame, text="(支持 k/KB/m/MB/g/GB，默认MB)").pack(side=tk.LEFT)
+
+        # 初始化文件名示例
+        self.update_filename_example()
 
     # 控件可见性控制
     def toggle_image_format_visibility(self):
@@ -392,10 +398,28 @@ class ConverterGUI:
             self.overlap_frame.pack(anchor=tk.W, padx=20, pady=2)
 
     def toggle_filename_visibility(self):
-        if self.format_var.get() in (3,4,5):
+        fmt = self.format_var.get()
+        if fmt in (3, 4, 5):
             self.filename_frame.pack(fill=tk.X, pady=5)
+            self.update_filename_example()
         else:
             self.filename_frame.pack_forget()
+
+    def update_filename_example(self):
+        # 重建 filename_frame 中的内容，以更新扩展名示例
+        for widget in self.filename_frame.winfo_children():
+            widget.destroy()
+        fmt = self.format_var.get()
+        if fmt == 3:
+            ext = "xtg"
+        elif fmt == 4:
+            ext = "xth"
+        elif fmt == 5:
+            ext = self.image_format_var.get()
+        else:
+            return
+        ttk.Radiobutton(self.filename_frame, text=f"编号 (例如 1.{ext})", variable=self.filename_format_var, value=1).pack(anchor=tk.W)
+        ttk.Radiobutton(self.filename_frame, text=f"电子书名-编号 (例如 电子书名-1.{ext})", variable=self.filename_format_var, value=2).pack(anchor=tk.W)
 
     def toggle_split_visibility(self):
         if self.format_var.get() in (1,2):
@@ -504,7 +528,10 @@ class ConverterGUI:
         if out_type == "format" and out_value in ('xtc', 'xtch'):
             split_size = self.get_split_size()
             if split_size is None:
-                return None   # 自定义分包大小无效
+                return None
+        filename_format = None
+        if out_type == "image" or (out_type == "format" and out_value in ('xtg', 'xth')):
+            filename_format = self.filename_format_var.get() - 1
         settings = {
             'out_type': out_type,
             'out_value': out_value,
@@ -516,7 +543,7 @@ class ConverterGUI:
             'stretch': self.stretch_var.get() if res_type != "original" else False,
             'dither_strength': self.dither_strength.get(),
             'max_workers': self.max_workers.get(),
-            'filename_format': self.filename_format_var.get() - 1 if out_type == "image" or (out_type == "format" and out_value in ('xtg','xth')) else None,
+            'filename_format': filename_format,
             'split_size': split_size,
             'gif_mode': self.gif_mode_var.get()
         }
@@ -534,7 +561,7 @@ class ConverterGUI:
 
         settings = self.build_settings()
         if settings is None:
-            return  # 分包大小无效，已弹出错误
+            return
 
         setup_gui_logging(self.log_queue, enable_file_log=self.enable_file_log.get())
 
@@ -592,7 +619,7 @@ class ConverterGUI:
                                 logging.error(f"提取文本失败: {item.name}")
                         else:
                             logging.info(f"用户选择跳过: {item.name}")
-                    else:  # mixed
+                    else:
                         self.root.after(0, lambda: self.log_text_insert(f"本书为图文混排电子书，本工具暂不支持转换，建议使用其他工具转换为PDF格式后再使用本工具转换！\n"))
                         logging.info(f"本书为图文混排电子书: {item.name}")
                         if self.mixed_choice_memory is None:

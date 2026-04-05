@@ -190,8 +190,11 @@ def get_resolution_custom() -> Tuple[int, int]:
                 return w, h
         print("格式错误，请使用数字x数字，例如 800x1280")
 
-def get_filename_format() -> int:
-    options = {1: "编号 (例如 1.xtg)", 2: "电子书名-编号 (例如 电子书名-1.xtg)"}
+def get_filename_format(ext: str = "xtg") -> int:
+    options = {
+        1: f"编号 (例如 1.{ext})",
+        2: f"电子书名-编号 (例如 电子书名-1.{ext})"
+    }
     choice = get_user_choice("请选择输出文件名格式：", options, 1)
     return 0 if choice == 1 else 1
 
@@ -255,7 +258,7 @@ def get_output_format_choice():
     if choice == 5:
         print("\n请选择具体图片格式：")
         img_opts = {1: "JPEG (.jpg)", 2: "PNG (.png)", 3: "WebP (.webp)", 4: "BMP (.bmp)"}
-        img_choice = get_user_choice("", img_opts, 2)
+        img_choice = get_user_choice("", img_opts, 1)   # 默认改为 1 (JPEG)
         img_map = {1: "jpg", 2: "png", 3: "webp", 4: "bmp"}
         return ("image", img_map[img_choice])
     elif choice == 6:
@@ -314,15 +317,24 @@ def get_user_settings():
             max_workers = 61
     else:
         max_workers = default_workers
+
+    # 文件名格式（仅单页模式或图片格式需要）
     filename_format = None
     if out_type == "image" or (out_type == "format" and out_value in ('xtg', 'xth')):
-        filename_format = get_filename_format()
+        if out_type == "image":
+            ext = out_value   # jpg, png, webp, bmp
+        else:
+            ext = out_value   # xtg 或 xth
+        filename_format = get_filename_format(ext)
+
     split_size = None
     if out_type == "format" and out_value in ('xtc', 'xtch'):
         split_size = get_split_size()
+
     print("\nGIF 动图处理方式：")
     gif_options = {1: "只处理第一帧", 2: "处理所有帧", 3: "跳过 GIF 文件（不转换）"}
     gif_mode = get_user_choice("请选择：", gif_options, 1)
+
     return {
         'out_type': out_type,
         'out_value': out_value,
@@ -924,22 +936,27 @@ def create_epub(images: List[Image.Image], title: str, output_path: Path) -> boo
         book.set_identifier(title)
         book.set_title(title)
         book.set_language('zh')
-        cover_img = images[0] if images else None
-        if cover_img:
+        if images:
+            cover_img = images[0].convert('RGB')
             cover_data = io.BytesIO()
             cover_img.save(cover_data, format='PNG')
             cover_data.seek(0)
             book.set_cover("cover.png", cover_data.read())
         chapters = []
         for idx, img in enumerate(images):
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
             img_data = io.BytesIO()
             img.save(img_data, format='PNG')
             img_data.seek(0)
             img_name = f"image_{idx+1:04d}.png"
-            book.add_item(epub.EpubImage(uid=img_name, file_name=f"images/{img_name}", media_type="image/png", content=img_data.read()))
-            content = f'''<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
+            book.add_item(epub.EpubImage(
+                uid=img_name,
+                file_name=f"images/{img_name}",
+                media_type="image/png",
+                content=img_data.read()
+            ))
+            content = f'''<html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>Page {idx+1}</title></head>
 <body>
 <div style="text-align: center;">
@@ -947,19 +964,26 @@ def create_epub(images: List[Image.Image], title: str, output_path: Path) -> boo
 </div>
 </body>
 </html>'''
-            chap = epub.EpubHtml(title=f"Page {idx+1}", file_name=f"page_{idx+1:04d}.xhtml", lang='zh')
-            chap.content = content
+            chap = epub.EpubHtml(
+                title=f"Page {idx+1}",
+                file_name=f"page_{idx+1:04d}.xhtml",
+                lang='zh'
+            )
+            chap.content = content.encode('utf-8')
             book.add_item(chap)
             chapters.append(chap)
-        book.spine = ['nav'] + chapters
-        book.toc = [(epub.Section(title), chapters)]
-        book.add_item(epub.EpubNcx())
-        book.add_item(epub.EpubNav())
+        if not chapters:
+            logger.error("没有有效的页面内容，无法生成 EPUB")
+            return False
+        book.spine = chapters
+        book.toc = []
         epub.write_epub(output_path, book, {})
         logger.info(f"成功生成 EPUB: {output_path}")
         return True
     except Exception as e:
         logger.error(f"生成 EPUB 失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 def create_pdf(images: List[Image.Image], title: str, output_path: Path) -> bool:
