@@ -320,7 +320,6 @@ def get_user_settings():
     split_size = None
     if out_type == "format" and out_value in ('xtc', 'xtch'):
         split_size = get_split_size()
-    # GIF 处理选项
     print("\nGIF 动图处理方式：")
     gif_options = {1: "只处理第一帧", 2: "处理所有帧", 3: "跳过 GIF 文件（不转换）"}
     gif_mode = get_user_choice("请选择：", gif_options, 1)
@@ -479,7 +478,7 @@ class XTCReader:
         self.title = ""
         self.author = ""
         self.is_hq = False
-        self.chapters = []          # 初始化章节列表
+        self.chapters = []
         self.f = None
         ext = os.path.splitext(filepath)[1].lower()
         if ext in ('.xtc', '.xtch'):
@@ -523,7 +522,7 @@ class XTCReader:
         files = []
         for ext in ('.xtg', '.xth'):
             files.extend(Path(dir_path).glob(f'*{ext}'))
-        files = natsorted(files, key=lambda p: p.name)   # 自然排序
+        files = natsorted(files, key=lambda p: p.name)
         if not files:
             raise ValueError(f"目录 {dir_path} 中没有找到 .xtg 或 .xth 文件")
         self.page_files = [str(f) for f in files]
@@ -662,7 +661,6 @@ class InputItem:
 
 def scan_input_items(root_dir: Path) -> List[InputItem]:
     items = []
-    # 1. 压缩包
     archive_exts = {'.zip', '.cbz', '.7z', '.cbr', '.rar'}
     for dirpath, _, filenames in os.walk(root_dir):
         for f in filenames:
@@ -674,7 +672,6 @@ def scan_input_items(root_dir: Path) -> List[InputItem]:
                     doc_type='comic',
                     image_getter=lambda p=path: extract_images_from_archive(p)
                 ))
-    # 2. 文件夹电子书（普通图片文件夹）
     folder_items = find_folder_ebooks(root_dir)
     for name, img_paths in folder_items:
         items.append(InputItem(
@@ -682,7 +679,6 @@ def scan_input_items(root_dir: Path) -> List[InputItem]:
             doc_type='comic',
             image_getter=lambda paths=img_paths: [Image.open(p) for p in paths]
         ))
-    # 3. XTC/XTCH 容器文件
     for dirpath, _, filenames in os.walk(root_dir):
         for f in filenames:
             ext = os.path.splitext(f)[1].lower()
@@ -693,7 +689,6 @@ def scan_input_items(root_dir: Path) -> List[InputItem]:
                     doc_type='comic',
                     image_getter=lambda p=path: extract_images_from_container(p)
                 ))
-    # 4. XTG/XTH 单页集合
     single_page_dirs = set()
     for dirpath, _, filenames in os.walk(root_dir):
         for f in filenames:
@@ -706,7 +701,6 @@ def scan_input_items(root_dir: Path) -> List[InputItem]:
             doc_type='comic',
             image_getter=lambda dir_path=d: extract_images_from_single_pages(dir_path)
         ))
-    # 5. 电子书文件（EPUB, MOBI, AZW3, PDF）
     ebook_exts = {'.epub', '.mobi', '.azw3', '.pdf'}
     for dirpath, _, filenames in os.walk(root_dir):
         for f in filenames:
@@ -739,7 +733,6 @@ def scan_input_items(root_dir: Path) -> List[InputItem]:
                         image_getter=lambda p=path: extract_images_from_ebook(p),
                         text_getter=lambda p=path: extract_text_from_ebook(p)
                     ))
-    # 去重（简单去重）
     seen = set()
     unique = []
     for item in items:
@@ -755,10 +748,14 @@ def extract_images_from_archive(archive_path: Path) -> List[Image.Image]:
         if not extract_archive(archive_path, tmp_path):
             logger.error(f"解压失败: {archive_path}")
             return []
-        images = collect_images(tmp_path)
-        if not images:
+        image_paths = collect_images(tmp_path)
+        if not image_paths:
             return []
-        return [Image.open(p) for p in images]
+        images = []
+        for p in image_paths:
+            with Image.open(p) as img:
+                images.append(img.copy())
+        return images
 
 def extract_images_from_container(container_path: Path) -> List[Image.Image]:
     reader = XTCReader(str(container_path))
@@ -775,7 +772,7 @@ def extract_images_from_single_pages(dir_path: Path) -> List[Image.Image]:
     files = []
     for ext in ('.xtg', '.xth'):
         files.extend(dir_path.glob(f'*{ext}'))
-    files = natsorted(files, key=lambda p: p.name)   # 自然排序
+    files = natsorted(files, key=lambda p: p.name)
     images = []
     for f in files:
         with open(f, 'rb') as fp:
@@ -927,7 +924,6 @@ def create_epub(images: List[Image.Image], title: str, output_path: Path) -> boo
         book.set_identifier(title)
         book.set_title(title)
         book.set_language('zh')
-        # 封面
         cover_img = images[0] if images else None
         if cover_img:
             cover_data = io.BytesIO()
@@ -1001,13 +997,11 @@ def process_images_to_ebook(images: List[Image.Image], title: str, settings: dic
         return False
 
 def init_worker():
-    # 子进程日志初始化，避免日志混乱
     logging.getLogger().handlers.clear()
     logging.getLogger().addHandler(logging.NullHandler())
 
 def process_images(images: List[Image.Image], title: str, settings: dict, output_base_dir: Path,
                    progress_callback: Optional[Callable[[str, int, int], None]] = None) -> bool:
-    # 处理 GIF 多帧/跳过选项
     gif_mode = settings.get('gif_mode', 1)
     new_images = []
     for img in images:
@@ -1083,18 +1077,23 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
         if not pages_data:
             logger.error(f"没有成功处理任何图片: {title}")
             return False
-        output_format = settings['out_value'] if settings['out_type'] == 'format' else None
+
         output_base_dir.mkdir(parents=True, exist_ok=True)
-        if output_format in ('jpg', 'png', 'webp', 'bmp'):
+
+        if out_type == 'image':
+            ext = out_value
             out_dir = output_base_dir / sanitize_filename(title)
             out_dir.mkdir(parents=True, exist_ok=True)
-            ext = output_format
+            filename_format = settings.get('filename_format', 0)
             for idx, page_data in enumerate(pages_data):
                 if is_1bit:
                     img = XTCReader._decode_xtg(page_data)
                 else:
                     img = XTCReader._decode_xth(page_data)
-                filename = f"{idx+1:04d}.{ext}"
+                if filename_format == 0:
+                    filename = f"{idx+1:04d}.{ext}"
+                else:
+                    filename = f"{sanitize_filename(title)}-{idx+1:04d}.{ext}"
                 save_path = out_dir / filename
                 if ext == 'jpg':
                     if img.mode == 'L':
@@ -1109,17 +1108,14 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
                 logger.info(f"输出图片: {save_path}")
             logger.info(f"成功输出 {len(pages_data)} 张图片到 {out_dir}")
             return True
-        elif output_format in ('xtc', 'xtch'):
+
+        elif out_type == 'format' and out_value in ('xtc', 'xtch'):
             title_safe = sanitize_filename(title)
             author = "Unknown"
-            is_hq = (output_format == 'xtch')
+            is_hq = (out_value == 'xtch')
             ext = ".xtch" if is_hq else ".xtc"
             base_name = title_safe
             split_size = settings.get('split_size', 0)
-            parts = []
-            current_part = []
-            current_size = 0
-            # 收集每页的实际宽高
             page_dimensions = []
             for page_data in pages_data:
                 if len(page_data) >= 8:
@@ -1128,10 +1124,14 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
                     page_dimensions.append((w, h))
                 else:
                     page_dimensions.append((0, 0))
+            parts = []
+            current_part = []
+            current_part_start_idx = 0
+            current_size = 0
             for idx, page in enumerate(pages_data):
                 page_size = len(page)
                 if split_size > 0 and current_part and current_size + page_size > split_size:
-                    container = build_xtc_container(current_part, base_name, author, 0, 0, is_hq, page_dimensions[len(current_part_start_idx):idx] if 'current_part_start_idx' in locals() else None)
+                    container = build_xtc_container(current_part, base_name, author, 0, 0, is_hq, page_dimensions[current_part_start_idx:idx])
                     parts.append(container)
                     current_part = []
                     current_size = 0
@@ -1154,11 +1154,13 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
                     output_path = output_base_dir / filename
                     output_path.write_bytes(container)
                     logger.info(f"输出文件: {output_path} ({len(container)} bytes)")
-        else:  # xtg or xth
+            return True
+
+        elif out_type == 'format' and out_value in ('xtg', 'xth'):
             out_dir = output_base_dir / sanitize_filename(title)
             out_dir.mkdir(parents=True, exist_ok=True)
-            ext = ".xtg" if output_format == 'xtg' else ".xth"
-            filename_format = settings['filename_format']
+            ext = ".xtg" if out_value == 'xtg' else ".xth"
+            filename_format = settings.get('filename_format', 0)
             for idx, page_data in enumerate(pages_data, start=1):
                 if filename_format == 0:
                     filename = f"{idx}{ext}"
@@ -1168,14 +1170,16 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
                 output_path.write_bytes(page_data)
                 logger.info(f"写入文件: {output_path} ({len(page_data)} bytes)")
             logger.info(f"成功输出 {len(pages_data)} 个单页文件到 {out_dir}")
-        return True
+            return True
+
+        else:
+            logger.error(f"未知输出类型: {out_type}/{out_value}")
+            return False
 
 def convert_items(items: List[InputItem], output_dir: Path, settings: dict,
                   overall_progress_callback: Optional[Callable[[str, int, int], None]] = None) -> int:
     total = len(items)
     success_count = 0
-    skip_same_format = False
-    skip_1to2 = False
     text_choice_memory = None
     mixed_choice_memory = None
     for idx, item in enumerate(items):
@@ -1208,7 +1212,7 @@ def convert_items(items: List[InputItem], output_dir: Path, settings: dict,
             else:
                 logger.info(f"用户选择跳过: {item.name}")
                 continue
-        else:  # mixed
+        else:
             logger.info(f"本书为图文混排电子书，本工具暂不支持转换，建议使用其他工具转换为PDF格式后再使用本工具转换！")
             print(f"本书为图文混排电子书，本工具暂不支持转换，建议使用其他工具转换为PDF格式后再使用本工具转换！")
             if mixed_choice_memory is None:
@@ -1245,7 +1249,6 @@ def convert_items(items: List[InputItem], output_dir: Path, settings: dict,
                 logger.info(f"用户选择跳过: {item.name}")
                 continue
 
-        # 处理图片转换
         local_settings = settings.copy()
         if settings['res_type'] == 'original':
             local_settings['width'] = 0
