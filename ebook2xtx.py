@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-电子书/文档转 XTC/XTCH/XTG/XTH/图片/电子书 格式 (Ebook2XTX v1.5)
+电子书/文档转 XTC/XTCH/XTG/XTH/图片/电子书 格式 (Ebook2XTX v1.6)
 支持输出电子书格式：EPUB, PDF
 """
 
