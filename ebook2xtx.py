@@ -1363,7 +1363,7 @@ def convert_items(items: List[InputItem], output_dir: Path, settings: dict,
 
 def main():
     print("="*50)
-    print("Ebook2XTX v1.5 - 电子书转 XTC/XTCH/XTG/XTH/图片/电子书 格式")
+    print("Ebook2XTX v1.6 - 电子书转 XTC/XTCH/XTG/XTH/图片/电子书 格式")
     print("支持输出电子书：EPUB, PDF")
     print("="*50)
     settings = get_user_settings()
