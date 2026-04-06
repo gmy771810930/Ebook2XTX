@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-电子书/文档转 XTC/XTCH/XTG/XTH/图片/电子书 格式 (Ebook2XTX v1.6)
+电子书/文档转 XTC/XTCH/XTG/XTH/图片/电子书 格式 (Ebook2XTX v1.7)
 支持输出电子书格式：EPUB, PDF
+锐化、对比度、CLAHE、抖动算法选择、位深度可调(1-16)、抖动强度百分比
 """
 
 import os
@@ -38,7 +39,8 @@ def check_and_install_dependencies():
         ('ebooklib', 'import ebooklib'),
         ('BeautifulSoup4', 'from bs4 import BeautifulSoup'),
         ('mobi', 'import mobi'),
-        ('img2pdf', 'import img2pdf')
+        ('img2pdf', 'import img2pdf'),
+        ('opencv-python', 'import cv2')
     ]
     missing_packages = []
     for package, import_stmt in required:
@@ -82,6 +84,7 @@ from ebooklib import epub
 from bs4 import BeautifulSoup
 import mobi
 import img2pdf
+import cv2
 
 # ========== 日志配置 ==========
 def setup_logging():
@@ -89,7 +92,7 @@ def setup_logging():
     log_dir.mkdir(exist_ok=True)
     log_filename = log_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(log_filename, encoding='utf-8'),
@@ -134,6 +137,21 @@ def get_int_input(prompt: str, default: int) -> int:
         return default
     try:
         return int(value)
+    except ValueError:
+        print(f"无效输入，使用默认 {default}")
+        return default
+
+def get_percent_input(prompt: str, default: int) -> int:
+    value = input(f"{prompt} (0-100) [默认 {default}%]: ").strip()
+    if not value:
+        return default
+    try:
+        v = int(value)
+        if 0 <= v <= 100:
+            return v
+        else:
+            print("请输入0-100之间的整数，使用默认值")
+            return default
     except ValueError:
         print(f"无效输入，使用默认 {default}")
         return default
@@ -258,7 +276,7 @@ def get_output_format_choice():
     if choice == 5:
         print("\n请选择具体图片格式：")
         img_opts = {1: "JPEG (.jpg)", 2: "PNG (.png)", 3: "WebP (.webp)", 4: "BMP (.bmp)"}
-        img_choice = get_user_choice("", img_opts, 1)   # 默认改为 1 (JPEG)
+        img_choice = get_user_choice("", img_opts, 1)
         img_map = {1: "jpg", 2: "png", 3: "webp", 4: "bmp"}
         return ("image", img_map[img_choice])
     elif choice == 6:
@@ -306,7 +324,43 @@ def get_user_settings():
         stretch = (stretch_choice == 1)
     else:
         print("原分辨率模式下，拉伸选项无效，将保持原始比例。")
-    dither_strength = get_float_input("请输入抖动强度 (0-1 之间):", 0.7)
+
+    # 锐化
+    sharpen = get_percent_input("请输入锐化强度 (0-100%):", 20)
+    # 对比度
+    contrast = get_percent_input("请输入对比度强度 (0-100%):", 100)
+    # 局部对比度增强 (CLAHE)
+    clahe = get_percent_input("请输入局部对比度增强强度 (0-100%):", 50)
+
+    # 抖动算法
+    print("\n请选择抖动算法：")
+    dither_options = {1: "Floyd-Steinberg", 2: "Atkinson (默认)", 3: "无抖动"}
+    dither_choice = get_user_choice("", dither_options, 2)
+    dither_algo_map = {1: "Floyd-Steinberg", 2: "Atkinson", 3: "None"}
+    dither_algo = dither_algo_map[dither_choice]
+
+    # 位深度 (1-16，但实际超过8位无意义，限制1-8并允许16但当作8)
+    default_bits = 1 if out_type == "format" and out_value in ('xtc', 'xtg') else (2 if out_type == "format" and out_value in ('xtch', 'xth') else 8)
+    bits_input = input(f"请选择位深度 (1-16) [默认 {default_bits}]: ").strip()
+    if bits_input:
+        try:
+            bits = int(bits_input)
+            if bits < 1:
+                bits = 1
+            elif bits > 16:
+                bits = 16
+        except:
+            bits = default_bits
+    else:
+        bits = default_bits
+    # 对于输出格式，如果用户选了16位，实际上处理时仍按8位，因为PIL和抖动限制
+    if bits > 8:
+        print("注意：位深度超过8位将按8位处理，因为图像格式和抖动算法最高支持8位。")
+        bits = 8
+
+    # 抖动强度 (0-100%)
+    dither_strength = get_percent_input("请输入抖动强度 (0-100%):", 70)
+
     cpu_count = os.cpu_count() or 1
     default_workers = min(cpu_count, 61)
     workers_input = input(f"请输入同时处理的图片数量 (进程数，建议不超过 {default_workers}，默认 {default_workers}): ").strip()
@@ -318,13 +372,12 @@ def get_user_settings():
     else:
         max_workers = default_workers
 
-    # 文件名格式（仅单页模式或图片格式需要）
     filename_format = None
     if out_type == "image" or (out_type == "format" and out_value in ('xtg', 'xth')):
         if out_type == "image":
-            ext = out_value   # jpg, png, webp, bmp
+            ext = out_value
         else:
-            ext = out_value   # xtg 或 xth
+            ext = out_value
         filename_format = get_filename_format(ext)
 
     split_size = None
@@ -344,6 +397,11 @@ def get_user_settings():
         'rotate_mode': rotate_mode,
         'crop': crop_cfg,
         'stretch': stretch,
+        'sharpen': sharpen,
+        'contrast': contrast,
+        'clahe': clahe,
+        'dither_algo': dither_algo,
+        'output_bits': bits,
         'dither_strength': dither_strength,
         'max_workers': max_workers,
         'filename_format': filename_format,
@@ -408,79 +466,14 @@ def get_mobi_stats(mobi_path: Path) -> Tuple[int, int, int]:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 def extract_images_from_epub(epub_path: Path) -> List[Image.Image]:
-    import ebooklib
-    from ebooklib import epub
-    from bs4 import BeautifulSoup
-    import io
-    from PIL import Image
-    import logging
-    import os
-    logger = logging.getLogger(__name__)
-    
     book = epub.read_epub(epub_path)
-    
-    image_map = {}
-    for item in book.get_items():
-        if item.get_type() == ebooklib.ITEM_IMAGE:
-            orig_name = item.get_name()
-            content = item.get_content()
-            image_map[orig_name] = content
-            base = os.path.basename(orig_name)
-            image_map[base] = content
-    
-    spine_ids = []
-    for spine_item in book.spine:
-        if isinstance(spine_item, tuple):
-            ref = spine_item[0]
-        else:
-            ref = spine_item
-        spine_ids.append(ref)
-    
-    id_to_item = {item.get_id(): item for item in book.get_items() if item.get_type() == ebooklib.ITEM_DOCUMENT}
-    
+    image_items = [item for item in book.get_items() if item.get_type() == ebooklib.ITEM_IMAGE]
+    image_items.sort(key=lambda x: x.get_name())
     images = []
-    for idref in spine_ids:
-        item = id_to_item.get(idref)
-        if not item:
-            continue
-        content = item.get_content()
-        try:
-            html = content.decode('utf-8', errors='ignore')
-            soup = BeautifulSoup(html, 'html.parser')
-            img_tags = soup.find_all('img')
-            for img_tag in img_tags:
-                src = img_tag.get('src')
-                if not src:
-                    continue
-                norm_src = src.replace('\\', '/')
-                if norm_src.startswith('../'):
-                    norm_src = norm_src[3:]
-                elif norm_src.startswith('./'):
-                    norm_src = norm_src[2:]
-                img_data = image_map.get(norm_src)
-                if img_data is None:
-                    base = os.path.basename(norm_src)
-                    img_data = image_map.get(base)
-                if img_data is not None:
-                    img = Image.open(io.BytesIO(img_data))
-                    images.append(img)
-                else:
-                    logger.warning(f"无法匹配图片: {src}")
-        except Exception as e:
-            logger.warning(f"解析文档出错: {e}")
-    
-    if not images:
-        logger.warning("按 spine 顺序未提取到图片，回退到自然排序")
-        from natsort import natsorted
-        image_items = [item for item in book.get_items() if item.get_type() == ebooklib.ITEM_IMAGE]
-        image_items = natsorted(image_items, key=lambda x: x.get_name())
-        for img_item in image_items:
-            img_data = img_item.get_content()
-            img = Image.open(io.BytesIO(img_data))
-            images.append(img)
-        logger.info(f"自然排序提取到 {len(images)} 张图片")
-    else:
-        logger.info(f"按 spine 顺序提取到 {len(images)} 张图片")
+    for img_item in image_items:
+        img_data = img_item.get_content()
+        img = Image.open(io.BytesIO(img_data))
+        images.append(img)
     return images
 
 def extract_images_from_pdf(pdf_path: Path, dpi: int = 150) -> List[Image.Image]:
@@ -576,17 +569,17 @@ class XTCReader:
             self.is_hq = True
         else:
             raise ValueError(f"未知文件格式: {magic}")
-        self.f.read(2)  # version
+        self.f.read(2)
         self.page_count = struct.unpack('<H', self.f.read(2))[0]
-        self.f.read(1)  # read_dir
+        self.f.read(1)
         has_metadata = self.f.read(1)[0]
-        self.f.read(1)  # has_thumbnails
+        self.f.read(1)
         has_chapters = self.f.read(1)[0]
-        self.f.read(4)  # current_page
+        self.f.read(4)
         metadata_offset = struct.unpack('<Q', self.f.read(8))[0]
         index_offset = struct.unpack('<Q', self.f.read(8))[0]
         data_offset = struct.unpack('<Q', self.f.read(8))[0]
-        self.f.read(8)  # thumb_offset
+        self.f.read(8)
         chapter_offset = struct.unpack('<Q', self.f.read(8))[0]
         if has_metadata:
             self._parse_metadata(metadata_offset)
@@ -619,7 +612,7 @@ class XTCReader:
         for i in range(self.page_count):
             page_offset = struct.unpack('<Q', self.f.read(8))[0]
             page_size = struct.unpack('<I', self.f.read(4))[0]
-            self.f.read(4)  # width+height
+            self.f.read(4)
             self.pages.append((page_offset, page_size))
 
     def _parse_chapters(self, offset):
@@ -1085,10 +1078,6 @@ def process_images_to_ebook(images: List[Image.Image], title: str, settings: dic
         logger.error(f"不支持的电子书格式: {out_format}")
         return False
 
-def init_worker():
-    logging.getLogger().handlers.clear()
-    logging.getLogger().addHandler(logging.NullHandler())
-
 def process_images(images: List[Image.Image], title: str, settings: dict, output_base_dir: Path,
                    progress_callback: Optional[Callable[[str, int, int], None]] = None) -> bool:
     gif_mode = settings.get('gif_mode', 1)
@@ -1121,12 +1110,21 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
 
     out_type = settings.get('out_type')
     out_value = settings.get('out_value')
+    # 根据输出格式确定 format 键（用于 core.py 中的编码判断）
     if out_type == 'format' and out_value in ('xtch', 'xth'):
         bits = 2
     else:
         bits = 1
     settings['format'] = 'xth' if bits == 2 else 'xtg'
     is_1bit = (settings['format'] == 'xtg')
+
+    # 传递增强参数到 core
+    settings['sharpen'] = settings.get('sharpen', 0)
+    settings['contrast'] = settings.get('contrast', 0)
+    settings['clahe'] = settings.get('clahe', 0)
+    settings['dither_algo'] = settings.get('dither_algo', 'Floyd-Steinberg')
+    settings['output_bits'] = settings.get('output_bits', 1)
+    settings['dither_strength'] = settings.get('dither_strength', 70)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
@@ -1140,6 +1138,7 @@ def process_images(images: List[Image.Image], title: str, settings: dict, output
         pages_data_list = [None] * total
         failed_images = []
         args_list = [(img_path, idx, total, settings) for idx, img_path in enumerate(img_paths)]
+        # 注意：移除了 initializer=init_worker 以避免打包后多进程错误
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_process_single_image, args) for args in args_list]
             completed_count = 0
@@ -1363,7 +1362,7 @@ def convert_items(items: List[InputItem], output_dir: Path, settings: dict,
 
 def main():
     print("="*50)
-    print("Ebook2XTX v1.6 - 电子书转 XTC/XTCH/XTG/XTH/图片/电子书 格式")
+    print("Ebook2XTX v1.7 - 电子书转 XTC/XTCH/XTG/XTH/图片/电子书 格式")
     print("支持输出电子书：EPUB, PDF")
     print("="*50)
     settings = get_user_settings()

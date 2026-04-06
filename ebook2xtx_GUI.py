@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-电子书转换工具 - 图形化界面 (Ebook2XTX v1.6)
+电子书转换工具 - 图形化界面 (Ebook2XTX v1.7)
 基于 tkinter，与 Ebook2XTX.py 共享核心处理逻辑
 支持输出图片格式、原分辨率、电子书输入等
 支持输出电子书格式（EPUB/PDF）
+独立预览窗口、独立日志窗口、预览实时渲染
 """
 
 import os
@@ -33,7 +34,8 @@ def ensure_dependencies():
         ('ebooklib', 'import ebooklib'),
         ('BeautifulSoup4', 'from bs4 import BeautifulSoup'),
         ('mobi', 'import mobi'),
-        ('img2pdf', 'import img2pdf')
+        ('img2pdf', 'import img2pdf'),
+        ('opencv-python', 'import cv2')
     ]
     missing = []
     for pkg, stmt in required:
@@ -54,6 +56,16 @@ from ebook2xtx import (
     parse_size_string, check_and_install_dependencies, scan_input_items,
     InputItem, sanitize_filename, process_images, process_images_to_ebook
 )
+
+# ========== 检测预览模块是否存在 ==========
+PREVIEW_AVAILABLE = False
+try:
+    # 尝试导入，同时检测文件是否存在
+    from ebook2xtx_gui_viewer import PreviewWindow
+    PREVIEW_AVAILABLE = True
+except ImportError:
+    PreviewWindow = None
+    print("提示: 未找到 ebook2xtx_gui_viewer.py，预览功能不可用")
 
 # ========== 日志重定向 ==========
 class QueueHandler(logging.Handler):
@@ -77,6 +89,36 @@ def setup_gui_logging(log_queue, enable_file_log=False):
         file_handler = logging.FileHandler(log_filename, encoding='utf-8')
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logging.getLogger().addHandler(file_handler)
+
+# ========== 独立日志窗口 ==========
+class LogWindow(tk.Toplevel):
+    def __init__(self, parent, log_queue):
+        super().__init__(parent)
+        self.title("Ebook2XTX 日志")
+        self.geometry("800x500")
+        self.protocol("WM_DELETE_WINDOW", self.hide)
+        self.log_text = scrolledtext.ScrolledText(self, state=tk.DISABLED, wrap=tk.WORD)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_queue = log_queue
+        self.after(500, self.update_logs)
+
+    def update_logs(self):
+        try:
+            while True:
+                record = self.log_queue.get_nowait()
+                self.log_text.config(state=tk.NORMAL)
+                self.log_text.insert(tk.END, record + "\n")
+                self.log_text.see(tk.END)
+                self.log_text.config(state=tk.DISABLED)
+        except queue.Empty:
+            pass
+        self.after(500, self.update_logs)
+
+    def hide(self):
+        self.withdraw()
+
+    def show(self):
+        self.deiconify()
 
 # ========== 可滚动框架 ==========
 class ScrollableFrame(ttk.Frame):
@@ -103,20 +145,20 @@ class ScrollableFrame(ttk.Frame):
 
 # ========== 主窗口类 ==========
 class ConverterGUI:
-    VERSION = "1.6"
+    VERSION = "1.7"
     GITHUB_URL = "https://github.com/gmy771810930/Ebook2XTX"
 
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Ebook2XTX")
-        self.root.geometry("1100x750")
-        self.root.minsize(900, 700)
+        self.root.geometry("1200x900")
+        self.root.minsize(1000, 800)
 
         # 变量存储
         self.input_dir = tk.StringVar(value=str(Path.cwd()))
         self.output_dir = tk.StringVar(value=str(Path.cwd()))
         self.format_var = tk.IntVar(value=1)
-        self.image_format_var = tk.StringVar(value="jpg")   # 默认改为 jpg
+        self.image_format_var = tk.StringVar(value="jpg")
         self.ebook_format_var = tk.StringVar(value="epub")
         self.resolution_var = tk.IntVar(value=1)
         self.custom_width = tk.StringVar()
@@ -127,13 +169,18 @@ class ConverterGUI:
         self.crop_mode_var = tk.IntVar(value=1)
         self.crop_sub_var = tk.IntVar(value=1)
         self.overlap_percent = tk.IntVar(value=100)
-        self.dither_strength = tk.DoubleVar(value=0.7)
+        self.dither_strength = tk.DoubleVar(value=70)  # 0-100
         self.max_workers = tk.IntVar(value=min(os.cpu_count() or 1, 61))
         self.filename_format_var = tk.IntVar(value=1)
         self.split_size_var = tk.IntVar(value=1)
         self.custom_split_size = tk.StringVar()
         self.gif_mode_var = tk.IntVar(value=1)
         self.enable_file_log = tk.BooleanVar(value=False)
+        self.sharpen_var = tk.IntVar(value=20)  # 0-100
+        self.contrast_var = tk.IntVar(value=100)  # 0-100
+        self.clahe_var = tk.IntVar(value=50)  # 0-100
+        self.dither_algo_var = tk.StringVar(value="Atkinson")
+        self.output_bits_var = tk.IntVar(value=8)  # 0-16
 
         # 动态控件引用
         self.custom_res_frame = None
@@ -148,6 +195,10 @@ class ConverterGUI:
         self.log_queue = queue.Queue()
         setup_gui_logging(self.log_queue, enable_file_log=False)
 
+        # 独立窗口引用（先初始化为 None）
+        self.log_window = None
+        self.preview_window = None
+
         self.build_ui()
         self.update_logs()
 
@@ -157,9 +208,9 @@ class ConverterGUI:
         self.text_choice_memory = None
         self.mixed_choice_memory = None
 
-        # 添加图片格式变化的追踪，以便更新文件名示例
-        self.image_format_var.trace_add('write', lambda *_: self.update_filename_example())
-        self.format_var.trace_add('write', lambda *_: self.update_filename_example())
+        # 日志提示预览模块状态
+        if not PREVIEW_AVAILABLE:
+            logging.warning("未找到 ebook2xtx_gui_viewer.py，预览功能不可用，预览按钮已禁用")
 
     def build_ui(self):
         main_frame = ttk.Frame(self.root)
@@ -176,23 +227,13 @@ class ConverterGUI:
         ttk.Entry(dir_frame, textvariable=self.output_dir, width=50).grid(row=1, column=1, padx=5, sticky="ew")
         ttk.Button(dir_frame, text="浏览", command=self.browse_output).grid(row=1, column=2)
 
-        # 中间：PanedWindow
-        paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # 中间：参数选项（可滚动）
+        self.param_scroll = ScrollableFrame(main_frame)
+        self.param_scroll.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        param_content = self.param_scroll.get_content_frame()
+        self._build_option_panels(param_content)
 
-        # 左侧：参数选项（可滚动）
-        left_scroll = ScrollableFrame(paned)
-        left_content = left_scroll.get_content_frame()
-        self._build_option_panels(left_content)
-        paned.add(left_scroll, weight=2)
-
-        # 右侧：日志区域
-        log_frame = ttk.LabelFrame(paned, text="日志", padding="5")
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=15, state=tk.DISABLED, wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        paned.add(log_frame, weight=1)
-
-        # 底部：转换进度
+        # 底部：转换进度和控制按钮
         progress_frame = ttk.LabelFrame(main_frame, text="转换进度", padding="5")
         progress_frame.pack(fill=tk.X, padx=5, pady=5)
 
@@ -212,6 +253,15 @@ class ConverterGUI:
         self.start_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn = ttk.Button(btn_frame, text="停止", command=self.stop_conversion_cmd, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
+
+        # 预览按钮（根据模块可用性决定状态）
+        self.preview_btn = ttk.Button(btn_frame, text="预览", command=self.toggle_preview_window)
+        if not PREVIEW_AVAILABLE:
+            self.preview_btn.config(state=tk.DISABLED)
+        self.preview_btn.pack(side=tk.LEFT, padx=5)
+
+        self.log_window_btn = ttk.Button(btn_frame, text="打开日志窗口", command=self.toggle_log_window)
+        self.log_window_btn.pack(side=tk.LEFT, padx=5)
         about_btn = ttk.Button(btn_frame, text="关于", command=self.show_about)
         about_btn.pack(side=tk.LEFT, padx=5)
 
@@ -233,6 +283,7 @@ class ConverterGUI:
         self.format_var.trace_add('write', lambda *_: self.toggle_image_format_visibility())
         self.format_var.trace_add('write', lambda *_: self.toggle_ebook_format_visibility())
         self.resolution_var.trace_add('write', lambda *_: self.toggle_stretch_visibility())
+        self.format_var.trace_add('write', lambda *_: self.update_bits_default())
 
     def _build_option_panels(self, parent):
         left_col = ttk.Frame(parent)
@@ -288,7 +339,69 @@ class ConverterGUI:
         self.stretch_check = ttk.Checkbutton(opt_frame, text="拉伸至全屏", variable=self.stretch_var)
         self.stretch_check.pack(anchor=tk.W)
 
-        # 右侧列
+        # 右侧列：抖动算法与增强
+        dither_frame = ttk.LabelFrame(right_col, text="抖动算法与增强", padding="5")
+        dither_frame.pack(fill=tk.X, pady=5)
+
+        # 抖动算法
+        algo_row = ttk.Frame(dither_frame)
+        algo_row.pack(fill=tk.X, pady=2)
+        ttk.Label(algo_row, text="抖动算法:").pack(side=tk.LEFT)
+        algo_combo = ttk.Combobox(algo_row, textvariable=self.dither_algo_var, values=["Floyd-Steinberg", "Atkinson", "None"], state="readonly")
+        algo_combo.pack(side=tk.LEFT, padx=5)
+        algo_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_preview_if_open())
+
+        # 位深度
+        bits_row = ttk.Frame(dither_frame)
+        bits_row.pack(fill=tk.X, pady=2)
+        ttk.Label(bits_row, text="位深度 (1-16):").pack(side=tk.LEFT)
+        self.bits_spin = ttk.Spinbox(bits_row, from_=1, to=16, textvariable=self.output_bits_var, width=5)
+        self.bits_spin.pack(side=tk.LEFT, padx=5)
+        self.bits_spin.bind("<KeyRelease>", lambda e: self.validate_bits())
+        self.bits_spin.bind("<<Increment>>", lambda e: self.validate_bits())
+        self.bits_spin.bind("<<Decrement>>", lambda e: self.validate_bits())
+
+        # 抖动强度
+        dither_int_row = ttk.Frame(dither_frame)
+        dither_int_row.pack(fill=tk.X, pady=2)
+        ttk.Label(dither_int_row, text="抖动强度 (0-100%):").pack(side=tk.LEFT)
+        self.dither_scale = ttk.Scale(dither_int_row, from_=0, to=100, variable=self.dither_strength, orient=tk.HORIZONTAL, length=150)
+        self.dither_scale.pack(side=tk.LEFT, padx=5)
+        self.dither_label = ttk.Label(dither_int_row, text=f"{self.dither_strength.get():.0f}%")
+        self.dither_label.pack(side=tk.LEFT)
+        self.dither_strength.trace_add('write', lambda *_: self.dither_label.config(text=f"{self.dither_strength.get():.0f}%"))
+
+        # 锐化
+        sharpen_row = ttk.Frame(dither_frame)
+        sharpen_row.pack(fill=tk.X, pady=2)
+        ttk.Label(sharpen_row, text="锐化强度 (0-100%):").pack(side=tk.LEFT)
+        self.sharpen_scale = ttk.Scale(sharpen_row, from_=0, to=100, variable=self.sharpen_var, orient=tk.HORIZONTAL, length=150)
+        self.sharpen_scale.pack(side=tk.LEFT, padx=5)
+        self.sharpen_label = ttk.Label(sharpen_row, text=f"{self.sharpen_var.get():.0f}%")
+        self.sharpen_label.pack(side=tk.LEFT)
+        self.sharpen_var.trace_add('write', lambda *_: self.sharpen_label.config(text=f"{self.sharpen_var.get():.0f}%"))
+
+        # 对比度
+        contrast_row = ttk.Frame(dither_frame)
+        contrast_row.pack(fill=tk.X, pady=2)
+        ttk.Label(contrast_row, text="对比度强度 (0-100%):").pack(side=tk.LEFT)
+        self.contrast_scale = ttk.Scale(contrast_row, from_=0, to=100, variable=self.contrast_var, orient=tk.HORIZONTAL, length=150)
+        self.contrast_scale.pack(side=tk.LEFT, padx=5)
+        self.contrast_label = ttk.Label(contrast_row, text=f"{self.contrast_var.get():.0f}%")
+        self.contrast_label.pack(side=tk.LEFT)
+        self.contrast_var.trace_add('write', lambda *_: self.contrast_label.config(text=f"{self.contrast_var.get():.0f}%"))
+
+        # 局部对比度增强
+        clahe_row = ttk.Frame(dither_frame)
+        clahe_row.pack(fill=tk.X, pady=2)
+        ttk.Label(clahe_row, text="局部对比度增强 (0-100%):").pack(side=tk.LEFT)
+        self.clahe_scale = ttk.Scale(clahe_row, from_=0, to=100, variable=self.clahe_var, orient=tk.HORIZONTAL, length=150)
+        self.clahe_scale.pack(side=tk.LEFT, padx=5)
+        self.clahe_label = ttk.Label(clahe_row, text=f"{self.clahe_var.get():.0f}%")
+        self.clahe_label.pack(side=tk.LEFT)
+        self.clahe_var.trace_add('write', lambda *_: self.clahe_label.config(text=f"{self.clahe_var.get():.0f}%"))
+
+        # 画面切割
         crop_frame = ttk.LabelFrame(right_col, text="画面切割", padding="5")
         crop_frame.pack(fill=tk.X, pady=5)
         ttk.Radiobutton(crop_frame, text="不切割", variable=self.crop_mode_var, value=1, command=self.toggle_crop_sub).pack(anchor=tk.W)
@@ -297,23 +410,13 @@ class ConverterGUI:
         self.crop_sub_frame = ttk.Frame(crop_frame)
         self.overlap_frame = ttk.Frame(crop_frame)
 
+        # 高级选项
         other_frame = ttk.LabelFrame(right_col, text="高级选项", padding="5")
         other_frame.pack(fill=tk.X, pady=5)
-
-        dither_frame = ttk.Frame(other_frame)
-        dither_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(dither_frame, text="抖动强度 (0-1):").pack(side=tk.LEFT)
-        self.dither_scale = ttk.Scale(dither_frame, from_=0, to=1, variable=self.dither_strength, orient=tk.HORIZONTAL, length=150)
-        self.dither_scale.pack(side=tk.LEFT, padx=5)
-        self.dither_label = ttk.Label(dither_frame, text=f"{self.dither_strength.get():.2f}")
-        self.dither_label.pack(side=tk.LEFT)
-        def on_dither_change(*args):
-            self.dither_label.config(text=f"{self.dither_strength.get():.2f}")
-        self.dither_strength.trace_add('write', on_dither_change)
-
         ttk.Label(other_frame, text="并发进程数:").pack(anchor=tk.W, pady=2)
         ttk.Spinbox(other_frame, from_=1, to=61, textvariable=self.max_workers, width=10).pack(anchor=tk.W)
 
+        # GIF 处理
         gif_frame = ttk.LabelFrame(right_col, text="GIF 处理", padding="5")
         gif_frame.pack(fill=tk.X, pady=5)
         ttk.Radiobutton(gif_frame, text="只处理第一帧", variable=self.gif_mode_var, value=1).pack(anchor=tk.W)
@@ -321,8 +424,6 @@ class ConverterGUI:
         ttk.Radiobutton(gif_frame, text="跳过 GIF 文件（不转换）", variable=self.gif_mode_var, value=3).pack(anchor=tk.W)
 
         self.filename_frame = ttk.LabelFrame(right_col, text="单页文件名格式", padding="5")
-        # 内容动态填充，在 update_filename_example 中重建
-
         self.split_frame = ttk.LabelFrame(right_col, text="容器分包大小", padding="5")
         ttk.Radiobutton(self.split_frame, text="4GB (FAT32)", variable=self.split_size_var, value=1, command=self.toggle_split_custom).pack(anchor=tk.W)
         ttk.Radiobutton(self.split_frame, text="自定义", variable=self.split_size_var, value=2, command=self.toggle_split_custom).pack(anchor=tk.W)
@@ -332,8 +433,44 @@ class ConverterGUI:
         ttk.Entry(self.split_custom_frame, textvariable=self.custom_split_size, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.split_custom_frame, text="(支持 k/KB/m/MB/g/GB，默认MB)").pack(side=tk.LEFT)
 
-        # 初始化文件名示例
         self.update_filename_example()
+
+        # 绑定参数变化刷新预览
+        self.bind_preview_refresh()
+
+    def bind_preview_refresh(self):
+        vars_to_trace = [
+            self.format_var, self.resolution_var, self.auto_crop_var, self.rotate_var,
+            self.stretch_var, self.crop_mode_var, self.crop_sub_var, self.overlap_percent,
+            self.dither_strength, self.sharpen_var, self.contrast_var, self.clahe_var,
+            self.dither_algo_var, self.output_bits_var, self.image_format_var, self.ebook_format_var,
+            self.custom_width, self.custom_height
+        ]
+        for var in vars_to_trace:
+            var.trace_add('write', lambda *_: self.refresh_preview_if_open())
+
+    def refresh_preview_if_open(self):
+        if hasattr(self, 'preview_window') and self.preview_window and self.preview_window.winfo_exists():
+            self.preview_window.refresh_preview()
+
+    def validate_bits(self):
+        try:
+            val = int(self.output_bits_var.get())
+            if val < 1:
+                self.output_bits_var.set(1)
+            elif val > 16:
+                self.output_bits_var.set(16)
+        except:
+            self.output_bits_var.set(8)
+
+    def update_bits_default(self):
+        fmt = self.format_var.get()
+        if fmt in (1,3):
+            self.output_bits_var.set(1)
+        elif fmt in (2,4):
+            self.output_bits_var.set(2)
+        else:
+            self.output_bits_var.set(8)
 
     # 控件可见性控制
     def toggle_image_format_visibility(self):
@@ -397,16 +534,7 @@ class ConverterGUI:
             ttk.Spinbox(self.overlap_frame, from_=0, to=100, textvariable=self.overlap_percent, width=5).pack(side=tk.LEFT, padx=5)
             self.overlap_frame.pack(anchor=tk.W, padx=20, pady=2)
 
-    def toggle_filename_visibility(self):
-        fmt = self.format_var.get()
-        if fmt in (3, 4, 5):
-            self.filename_frame.pack(fill=tk.X, pady=5)
-            self.update_filename_example()
-        else:
-            self.filename_frame.pack_forget()
-
     def update_filename_example(self):
-        # 重建 filename_frame 中的内容，以更新扩展名示例
         for widget in self.filename_frame.winfo_children():
             widget.destroy()
         fmt = self.format_var.get()
@@ -420,6 +548,14 @@ class ConverterGUI:
             return
         ttk.Radiobutton(self.filename_frame, text=f"编号 (例如 1.{ext})", variable=self.filename_format_var, value=1).pack(anchor=tk.W)
         ttk.Radiobutton(self.filename_frame, text=f"电子书名-编号 (例如 电子书名-1.{ext})", variable=self.filename_format_var, value=2).pack(anchor=tk.W)
+
+    def toggle_filename_visibility(self):
+        fmt = self.format_var.get()
+        if fmt in (3,4,5):
+            self.filename_frame.pack(fill=tk.X, pady=5)
+            self.update_filename_example()
+        else:
+            self.filename_frame.pack_forget()
 
     def toggle_split_visibility(self):
         if self.format_var.get() in (1,2):
@@ -437,6 +573,8 @@ class ConverterGUI:
         dirname = filedialog.askdirectory(title="选择包含输入文件的目录", initialdir=self.input_dir.get())
         if dirname:
             self.input_dir.set(dirname)
+            if hasattr(self, 'preview_window') and self.preview_window and self.preview_window.winfo_exists():
+                self.preview_window.load_current_book()
 
     def browse_output(self):
         dirname = filedialog.askdirectory(title="选择输出目录", initialdir=self.output_dir.get())
@@ -541,6 +679,11 @@ class ConverterGUI:
             'rotate_mode': rotate_mode,
             'crop': self.get_crop_settings(),
             'stretch': self.stretch_var.get() if res_type != "original" else False,
+            'sharpen': self.sharpen_var.get(),
+            'contrast': self.contrast_var.get(),
+            'clahe': self.clahe_var.get(),
+            'dither_algo': self.dither_algo_var.get(),
+            'output_bits': self.output_bits_var.get(),
             'dither_strength': self.dither_strength.get(),
             'max_workers': self.max_workers.get(),
             'filename_format': filename_format,
@@ -548,6 +691,29 @@ class ConverterGUI:
             'gif_mode': self.gif_mode_var.get()
         }
         return settings
+
+    def toggle_log_window(self):
+        if self.log_window is None or not self.log_window.winfo_exists():
+            self.log_window = LogWindow(self.root, self.log_queue)
+            self.log_window.show()
+        else:
+            if self.log_window.state() == 'withdrawn':
+                self.log_window.show()
+            else:
+                self.log_window.hide()
+
+    def toggle_preview_window(self):
+        if not PREVIEW_AVAILABLE:
+            messagebox.showinfo("预览功能不可用", "未找到预览模块 ebook2xtx_gui_viewer.py")
+            return
+        if self.preview_window is None or not self.preview_window.winfo_exists():
+            self.preview_window = PreviewWindow(self.root, self)
+            self.preview_window.show()
+        else:
+            if self.preview_window.state() == 'withdrawn':
+                self.preview_window.show()
+            else:
+                self.preview_window.hide()
 
     def start_conversion(self):
         input_dir = self.input_dir.get().strip()
@@ -590,11 +756,9 @@ class ConverterGUI:
                         break
 
                     if item.doc_type == 'comic':
-                        self.root.after(0, lambda: self.log_text_insert(f"本书为纯图片电子书\n"))
                         logging.info(f"本书为纯图片电子书: {item.name}")
                         processed_items.append(item)
                     elif item.doc_type == 'text':
-                        self.root.after(0, lambda: self.log_text_insert(f"本书为纯文本电子书，建议直接打开阅读，不建议转换！\n"))
                         logging.info(f"本书为纯文本电子书: {item.name}")
                         if self.text_choice_memory is None:
                             event = threading.Event()
@@ -612,15 +776,12 @@ class ConverterGUI:
                             if txt:
                                 txt_path = Path(output_dir) / f"{sanitize_filename(item.name)}.txt"
                                 txt_path.write_text(txt, encoding='utf-8')
-                                self.root.after(0, lambda: self.log_text_insert(f"已保存 TXT 文件: {txt_path}\n"))
                                 logging.info(f"已保存 TXT 文件: {txt_path}")
                             else:
-                                self.root.after(0, lambda: self.log_text_insert(f"提取文本失败: {item.name}\n"))
                                 logging.error(f"提取文本失败: {item.name}")
                         else:
                             logging.info(f"用户选择跳过: {item.name}")
                     else:
-                        self.root.after(0, lambda: self.log_text_insert(f"本书为图文混排电子书，本工具暂不支持转换，建议使用其他工具转换为PDF格式后再使用本工具转换！\n"))
                         logging.info(f"本书为图文混排电子书: {item.name}")
                         if self.mixed_choice_memory is None:
                             event = threading.Event()
@@ -655,10 +816,8 @@ class ConverterGUI:
                             if txt:
                                 txt_path = Path(output_dir) / f"{sanitize_filename(item.name)}.txt"
                                 txt_path.write_text(txt, encoding='utf-8')
-                                self.root.after(0, lambda: self.log_text_insert(f"已保存 TXT 文件: {txt_path}\n"))
                                 logging.info(f"已保存 TXT 文件: {txt_path}")
                             else:
-                                self.root.after(0, lambda: self.log_text_insert(f"提取文本失败: {item.name}\n"))
                                 logging.error(f"提取文本失败: {item.name}")
                         else:
                             logging.info(f"用户选择跳过: {item.name}")
@@ -669,7 +828,7 @@ class ConverterGUI:
                     for idx, item in enumerate(processed_items):
                         if self.stop_conversion:
                             break
-                        self.root.after(0, lambda: self._update_progress_ui(item.name, idx+1, total))
+                        self.root.after(0, lambda name=item.name, cur=idx+1, tot=total: self._update_progress_ui(name, cur, tot))
                         local_settings = settings.copy()
                         if settings['res_type'] == 'original':
                             local_settings['width'] = 0
@@ -733,12 +892,6 @@ class ConverterGUI:
         self.total_label.config(text="正在停止（可能需要等待当前任务完成）...")
         messagebox.showinfo("提示", "停止操作将等待当前图片处理完成，请稍后。")
 
-    def log_text_insert(self, text):
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, text)
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
-
     def _update_progress_ui(self, archive_name, current, total):
         if total > 0:
             percent = current / total * 100
@@ -750,15 +903,8 @@ class ConverterGUI:
         self.file_label.config(text=f"当前文件: {archive_name} ({current}/{total})")
 
     def update_logs(self):
-        try:
-            while True:
-                record = self.log_queue.get_nowait()
-                self.log_text.config(state=tk.NORMAL)
-                self.log_text.insert(tk.END, record + "\n")
-                self.log_text.see(tk.END)
-                self.log_text.config(state=tk.DISABLED)
-        except queue.Empty:
-            pass
+        if self.log_window and self.log_window.winfo_exists():
+            self.log_window.update_logs()
         self.root.after(500, self.update_logs)
 
     def show_about(self):
