@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-电子书转换工具 - 图形化界面 (Ebook2XTX v1.7)
+电子书转换工具 - 图形化界面 (Ebook2XTX v1.7.1)
 基于 tkinter，与 Ebook2XTX.py 共享核心处理逻辑
 支持输出图片格式、原分辨率、电子书输入等
 支持输出电子书格式（EPUB/PDF）
@@ -145,7 +145,7 @@ class ScrollableFrame(ttk.Frame):
 
 # ========== 主窗口类 ==========
 class ConverterGUI:
-    VERSION = "1.7"
+    VERSION = "1.7.1"
     GITHUB_URL = "https://github.com/gmy771810930/Ebook2XTX"
 
     def __init__(self):

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-电子书/文档转 XTC/XTCH/XTG/XTH/图片/电子书 格式 (Ebook2XTX v1.7)
+电子书/文档转 XTC/XTCH/XTG/XTH/图片/电子书 格式 (Ebook2XTX v1.7.1)
 支持输出电子书格式：EPUB, PDF
 锐化、对比度、CLAHE、抖动算法选择、位深度可调(1-16)、抖动强度百分比
 """
@@ -466,14 +466,79 @@ def get_mobi_stats(mobi_path: Path) -> Tuple[int, int, int]:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 def extract_images_from_epub(epub_path: Path) -> List[Image.Image]:
+    """按 spine 顺序提取 EPUB 中的图片"""
+    import ebooklib
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+    import io
+    from natsort import natsorted
+
     book = epub.read_epub(epub_path)
-    image_items = [item for item in book.get_items() if item.get_type() == ebooklib.ITEM_IMAGE]
-    image_items.sort(key=lambda x: x.get_name())
+
+    # 建立图片资源映射表（支持原始路径和文件名两种匹配方式）
+    image_map = {}
+    for item in book.get_items():
+        if item.get_type() == ebooklib.ITEM_IMAGE:
+            orig_name = item.get_name()
+            content = item.get_content()
+            image_map[orig_name] = content
+            base = os.path.basename(orig_name)
+            image_map[base] = content
+
+    # 获取 spine 中的文档顺序
+    spine_ids = []
+    for spine_item in book.spine:
+        if isinstance(spine_item, tuple):
+            ref = spine_item[0]
+        else:
+            ref = spine_item
+        spine_ids.append(ref)
+
+    # 文档 ID 到文档内容的映射
+    id_to_item = {item.get_id(): item for item in book.get_items() if item.get_type() == ebooklib.ITEM_DOCUMENT}
+
     images = []
-    for img_item in image_items:
-        img_data = img_item.get_content()
-        img = Image.open(io.BytesIO(img_data))
-        images.append(img)
+    for idref in spine_ids:
+        item = id_to_item.get(idref)
+        if not item:
+            continue
+        content = item.get_content()
+        try:
+            html = content.decode('utf-8', errors='ignore')
+            soup = BeautifulSoup(html, 'html.parser')
+            img_tags = soup.find_all('img')
+            for img_tag in img_tags:
+                src = img_tag.get('src')
+                if not src:
+                    continue
+                # 规范化路径
+                norm_src = src.replace('\\', '/')
+                if norm_src.startswith('../'):
+                    norm_src = norm_src[3:]
+                elif norm_src.startswith('./'):
+                    norm_src = norm_src[2:]
+                img_data = image_map.get(norm_src)
+                if img_data is None:
+                    base = os.path.basename(norm_src)
+                    img_data = image_map.get(base)
+                if img_data is not None:
+                    img = Image.open(io.BytesIO(img_data))
+                    images.append(img)
+                else:
+                    logger.warning(f"无法匹配图片: {src}")
+        except Exception as e:
+            logger.warning(f"解析文档出错: {e}")
+
+    # 如果按 spine 未提取到任何图片，回退到自然排序（安全后备）
+    if not images:
+        logger.warning("按 spine 顺序未提取到图片，回退到自然排序")
+        image_items = [item for item in book.get_items() if item.get_type() == ebooklib.ITEM_IMAGE]
+        image_items = natsorted(image_items, key=lambda x: x.get_name())
+        for img_item in image_items:
+            img_data = img_item.get_content()
+            img = Image.open(io.BytesIO(img_data))
+            images.append(img)
+
     return images
 
 def extract_images_from_pdf(pdf_path: Path, dpi: int = 150) -> List[Image.Image]:
@@ -1362,7 +1427,7 @@ def convert_items(items: List[InputItem], output_dir: Path, settings: dict,
 
 def main():
     print("="*50)
-    print("Ebook2XTX v1.7 - 电子书转 XTC/XTCH/XTG/XTH/图片/电子书 格式")
+    print("Ebook2XTX v1.7.1 - 电子书转 XTC/XTCH/XTG/XTH/图片/电子书 格式")
     print("支持输出电子书：EPUB, PDF")
     print("="*50)
     settings = get_user_settings()
